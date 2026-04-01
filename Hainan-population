@@ -1,0 +1,240 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+import geopandas as gpd
+from climada.hazard import TropCyclone, Centroids
+from climada.entity import ImpactFuncSet
+from climada.entity.exposures.litpop import LitPop
+from climada.entity.impact_funcs.trop_cyclone import ImpfTropCyclone
+from climada.engine import ImpactCalc
+
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+# ── 0. 配置 ───────────────────────────────────────────────────────────────────
+HAZARD_FILE = Path("hainan_tc_hazard_1980_2020.h5")
+YEAR_RANGE  = (1980, 2020)
+N_YEARS     = YEAR_RANGE[1] - YEAR_RANGE[0] + 1
+DATA_DIR    = Path(r"D:\climada_hainan_energy")
+
+HAI_LON_MIN, HAI_LON_MAX = 108.5, 111.5
+HAI_LAT_MIN, HAI_LAT_MAX = 18.0,  20.5
+
+# ── 1. Hazard：HDF5 优先，否则从 IBTrACS 生成 ────────────────────────────────
+if HAZARD_FILE.exists():
+    print(f"[1/7] 加载已存在的 Hazard 文件: {HAZARD_FILE}")
+    haz = TropCyclone.from_hdf5(HAZARD_FILE)
+else:
+    print("[1/7] 本地无 Hazard 文件，开始从 IBTrACS 生成...")
+    from climada.hazard import TCTracks
+
+    print("      构建海南省 Centroids (108.5–111.5°E, 18–20.5°N, res=0.02°)…")
+    cent = Centroids.from_pnt_bounds(
+        points_bounds=(HAI_LON_MIN, HAI_LAT_MIN, HAI_LON_MAX, HAI_LAT_MAX),
+        res=0.02,
+    )
+
+    print("      读取 IBTrACS WP 轨迹 1980–2020…")
+    tracks = TCTracks.from_ibtracs_netcdf(
+        provider="usa",
+        year_range=YEAR_RANGE,
+        basin="WP",
+        estimate_missing=True,
+    )
+    print(f"      共读取 {tracks.size} 条台风轨迹")
+
+    print("      计算风场，生成 TropCyclone Hazard…")
+    haz = TropCyclone.from_tracks(tracks, centroids=cent)
+
+    haz.write_hdf5(str(HAZARD_FILE))
+    print(f"      Hazard 已保存至: {HAZARD_FILE}")
+
+print(f"      Hazard 事件数: {haz.size},  质心数: {haz.centroids.size}")
+print("Hazard 文件实际保存路径:", HAZARD_FILE.resolve())
+# ── 2. Exposure：使用本地海南人口密度 tif ────────────────────────────────
+import rasterio
+from climada.entity import Exposures
+from shapely.geometry import Point
+import pandas as pd
+
+print("\n[2/7] 使用本地海南人口密度 tif 构建 Exposure…")
+
+tif_path = r"D:\climada_hainan_energy\海南省人口密度tif\海南省人口密度tif2.tif"
+
+with rasterio.open(tif_path) as src:
+    band = src.read(1)
+    transform = src.transform
+
+rows, cols = np.where(band > 0)
+
+xs, ys = rasterio.transform.xy(transform, rows, cols)
+values = band[rows, cols]   # 先不做面积转换
+
+df = pd.DataFrame({
+    "longitude": xs,
+    "latitude": ys,
+    "value": values
+})
+
+gdf = gpd.GeoDataFrame(
+    df,
+    geometry=[Point(xy) for xy in zip(df.longitude, df.latitude)],
+    crs="EPSG:4326"
+)
+
+exp = Exposures(gdf)
+exp.gdf["impf_TC"] = 1
+exp.check()
+
+print(f"      点数: {len(exp.gdf)}")
+print(f"      总人口: {exp.gdf.value.sum():.3e}")
+
+# ── 3. Impact Function ────────────────────────────────────────────────────────
+print("\n[3/7] 设置 Emanuel USA 影响函数…")
+impf_tc  = ImpfTropCyclone.from_emanuel_usa()
+impf_set = ImpactFuncSet([impf_tc])
+
+# ── 4. 计算影响 ───────────────────────────────────────────────────────────────
+print("\n[4/7] 计算影响（Impact）…")
+impact = ImpactCalc(exposures=exp, impfset=impf_set, hazard=haz).impact(save_mat=True)
+
+# ── 5. 统计指标 ───────────────────────────────────────────────────────────────
+event_losses = np.array(impact.at_event)
+nonzero_mask = event_losses > 0
+aal          = impact.aai_agg
+max_loss     = event_losses.max()
+n_with_loss  = nonzero_mask.sum()
+
+print("\n —— 损失统计结果（海南省） ——")
+print(f"  年均影响人口 (AAL)  : {aal:.4e} 人")
+print(f"  最大单次事件影响     : {max_loss:.4e} 人")
+print(f"  有影响事件数        : {n_with_loss} / {haz.size}")
+
+
+# ── 6. 图1：单次事件影响柱状图 ───────────────────────────────────────────────
+nonzero_losses = np.sort(event_losses[nonzero_mask])[::-1]
+
+fig1, ax1 = plt.subplots(figsize=(10, 4))
+ax1.bar(range(len(nonzero_losses)), nonzero_losses / 1e4, color="steelblue", alpha=0.8)
+ax1.axhline(aal / 1e4, color="red", linestyle="--",
+            label=f"AAL = {aal/1e4:.2f} 万人/年")
+ax1.set_xlabel("事件排序（从大到小）")
+ax1.set_ylabel("受影响人口（万人）")
+ax1.set_title(f"海南省台风单次事件影响人口（1980–2020）\n有影响事件数: {n_with_loss}")
+ax1.legend()
+plt.tight_layout()
+
+# ── 7. 图2：损失超越频率曲线（OEP）──────────────────────────────────────────
+sorted_losses      = np.sort(event_losses[nonzero_mask])[::-1]
+annual_exceed_freq = np.arange(1, len(sorted_losses) + 1) / N_YEARS
+return_period      = 1.0 / annual_exceed_freq
+
+fig2, ax2 = plt.subplots(figsize=(9, 5))
+ax2.plot(return_period, sorted_losses / 1e4,
+         color="darkorange", linewidth=2, marker="o", markersize=3)
+ax2.set_xscale("log")
+ax2.set_xlabel("重现期（年）")
+ax2.set_ylabel("受影响人口（万人）")
+ax2.set_title("海南省台风影响人口超越频率曲线（OEP，1980–2020）")
+ax2.grid(True, which="both", linestyle="--", alpha=0.5)
+
+for rp in [10, 50, 100, 200]:
+    if return_period.min() <= rp <= return_period.max():
+        loss_at_rp = np.interp(rp, return_period[::-1], sorted_losses[::-1])
+        ax2.axvline(rp, color="gray", linestyle=":", alpha=0.7)
+        ax2.annotate(
+            f"{rp}yr\n{loss_at_rp/1e4:.1f}万",
+            xy=(rp, loss_at_rp / 1e4),
+            fontsize=8, color="dimgray",
+            xytext=(rp * 1.15, loss_at_rp / 1e4 * 1.05),
+        )
+
+plt.tight_layout()
+
+import matplotlib.pyplot as plt
+
+print("\n[5/7] 绘制空间影响地图…")
+
+# 每个点的年均影响（核心变量）
+exp.gdf["impact"] = impact.eai_exp
+
+# 画图
+fig, ax = plt.subplots(figsize=(6, 6))
+
+exp.gdf.plot(
+    column="impact",
+    ax=ax,
+    cmap="Reds",
+    markersize=1,
+    legend=True
+)
+
+ax.set_title("海南省台风年均影响人口空间分布")
+ax.set_xlabel("经度")
+ax.set_ylabel("纬度")
+
+plt.tight_layout()
+plt.show()
+
+# ── 8. 高影响区域识别 ───────────────────────────────────────────────
+print("\n[6/7]  高影响区域识别…")
+
+# Top 5% 阈值
+threshold = exp.gdf["impact"].quantile(0.95)
+high_impact = exp.gdf[exp.gdf["impact"] >= threshold]
+print(f"高影响点数量: {len(high_impact)}")
+
+print("\n[6.1] Top10 高影响节点…")
+top10 = exp.gdf.sort_values(by="impact", ascending=False).head(10)
+for i, row in top10.iterrows():
+    print(f"第{i}点: 经度={row.geometry.x:.4f}, 纬度={row.geometry.y:.4f}, 影响={row.impact:.2f}")
+
+# 可视化
+fig, ax = plt.subplots(figsize=(6,6))
+exp.gdf.plot(ax=ax, color="lightgrey", markersize=1)
+high_impact.plot(ax=ax, color="red", markersize=2)
+
+ax.set_title("高影响区域（Top 5%）")
+plt.tight_layout()
+plt.show()
+
+# ── 9. 热点分析（空间聚集）──────────────────────────────────────────
+print("\n[7/7]  热点分析…")
+# 从 geometry 提取经纬度（关键修复）
+exp.gdf["longitude"] = exp.gdf.geometry.x
+exp.gdf["latitude"]  = exp.gdf.geometry.y
+# 构造网格（0.5°）
+exp.gdf["lon_bin"] = (exp.gdf.longitude * 2).astype(int)
+exp.gdf["lat_bin"] = (exp.gdf.latitude * 2).astype(int)
+
+# 聚合
+hotspots = (
+    exp.gdf.groupby(["lon_bin","lat_bin"])["impact"]
+    .mean()
+    .reset_index()
+)
+
+# 取Top 10%
+threshold_hot = hotspots["impact"].quantile(0.9)
+hotspots = hotspots[hotspots["impact"] >= threshold_hot]
+
+# 转回坐标
+hotspots["lon"] = hotspots["lon_bin"] / 2
+hotspots["lat"] = hotspots["lat_bin"] / 2
+
+print(f"热点网格数量: {len(hotspots)}")
+
+# 可视化
+fig, ax = plt.subplots(figsize=(6,6))
+
+# 背景点
+exp.gdf.plot(ax=ax, color="lightgrey", markersize=1)
+
+# 热点
+ax.scatter(hotspots["lon"], hotspots["lat"], c="blue", s=20)
+
+ax.set_title("热点区域（高影响聚集）")
+plt.tight_layout()
+plt.show()
+
