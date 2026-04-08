@@ -1,1 +1,418 @@
+"""
+台风风场影响下的基础设施受损识别脚本
+第二部分：基于单次台风事件的基础设施受冲击分析（优化版 v3）
 
+修改说明（相对于原版）
+——————————————————————————————————————————————————————————————
+[修改1] 台风事件筛选：遍历全部 1259 个事件，仅保留最大风速 ≥ 35 m/s 的强台风
+[修改2] 采用 CLIMADA 内置 Emanuel Sigmoid 脆弱性函数计算每个节点的损伤概率
+[修改3] 节点颜色映射：无损伤按类型固定色，有损伤按 6 级离散红色分级
+[修改4] 线要素（电力/道路）用覆盖区域最大风速推算概率后上色
+[修改5] 输出每个节点的风速、损伤概率、颜色至 GeoDataFrame，并保存 CSV
+——————————————————————————————————————————————————————————————
+其余代码（数据读取、Hazard 加载路径、文件结构）保持不变
+"""
+
+import numpy as np
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
+import matplotlib.patches as mpatches
+from pathlib import Path
+from shapely.geometry import Point
+
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
+plt.rcParams['axes.unicode_minus'] = False
+
+# ── 路径与参数配置 ────────────────────────────────────────────────────────────
+DATA_DIR       = Path(r"D:\climada_hainan_energy")
+WIND_THRESHOLD = 17.5   # 风速阈值（m/s），低于此值的 centroid 不参与匹配
+BUFFER_DEG     = 0.05   # 空间缓冲半径基础值（度）
+MAX_BUFFER     = 0.08   # 空间缓冲半径上限（度）
+
+SHP_HOSPITAL = DATA_DIR / "海南省医院shp.shp"
+SHP_SCHOOL   = DATA_DIR / "海南省学校shp.shp"
+SHP_POWER    = DATA_DIR / "海南省电力shp.shp"
+SHP_ROAD     = DATA_DIR / "海南省道路shp.shp"
+
+# ── [修改3] 颜色配置 ──────────────────────────────────────────────────────────
+# 各类型设施无损伤时的固定颜色
+TYPE_COLOR = {
+    "hospital": "#35903A",
+    "school":   "#8363A1",
+    "power":    "#206E9E",
+    "road":     "#E47B26",
+}
+
+# 有损伤时的 5 级离散红色（由浅到深对应风险 1–5）
+RED_LEVELS = [
+    "#FE5757",
+    "#EA1E20",
+    "#BE0208",
+    "#9C000D",
+    "#790105",
+]
+
+
+def _prob_to_color(prob: float, node_type: str) -> str:
+    """将损伤概率映射为显示颜色：无损伤返回类型固定色，有损伤返回对应红色级别。"""
+    if prob <= 0:
+        return TYPE_COLOR[node_type]
+    level = min(int(prob * 4), 4)   # [0, 1] → 离散级别 0–4
+    return RED_LEVELS[level]
+
+
+# ── [修改2] Emanuel Sigmoid 脆弱性函数工具 ────────────────────────────────────
+def _build_impf():
+    """构建 ImpfTropCyclone Emanuel USA 脆弱性函数并返回。"""
+    from climada.entity.impact_funcs.trop_cyclone import ImpfTropCyclone
+    return ImpfTropCyclone.from_emanuel_usa()
+
+
+def _wind_to_prob(wind_ms: np.ndarray, impf) -> np.ndarray:
+    """将风速数组（m/s）转换为损伤概率数组（MDR，值域 [0, 1]）。"""
+    return impf.calc_mdr(wind_ms)
+
+
+# ── 主分析函数 ────────────────────────────────────────────────────────────────
+def analyze_infrastructure_impact(haz, tracks):
+    """
+    参数
+    ----
+    haz    : climada.hazard.TropCyclone
+    tracks : climada.hazard.TCTracks
+
+    返回
+    ----
+    hospital_impact, school_impact, power_impact, road_impact : GeoDataFrame
+    （每个 GeoDataFrame 含 wind_max、damage_prob、color_hex 列）
+    """
+
+    # ── Step 1：[修改1] 筛选强台风事件（max_wind ≥ 35 m/s） ─────────────────
+    print("[1/6] 筛选强台风事件（max_wind ≥ 35 m/s）…")
+    intensity_dense = haz.intensity.toarray()
+    print(f"      事件总数: {intensity_dense.shape[0]}，Centroid 数: {intensity_dense.shape[1]}")
+
+    max_wind_per_event = intensity_dense.max(axis=1)
+    strong_events = np.where(
+        (max_wind_per_event >= 30) &
+        (max_wind_per_event <= 40)
+    )[0]
+    print(f"      满足条件的强台风事件数: {len(strong_events)}")
+
+    if len(strong_events) == 0:
+        raise ValueError("没有找到最大风速 ≥ 35 m/s 的事件，请检查 Hazard 数据。")
+
+    # ── Step 2：[修改2] 初始化 Emanuel 脆弱性函数 ─────────────────────────────
+    print("\n[2/6] 加载 Emanuel Sigmoid 脆弱性函数…")
+    impf = _build_impf()
+
+    # ── Step 3：读取基础设施 shapefile ────────────────────────────────────────
+    print("\n[3/6] 读取基础设施 shp 文件…")
+    gdf_hospital = gpd.read_file(SHP_HOSPITAL).to_crs(epsg=4326)
+    gdf_school   = gpd.read_file(SHP_SCHOOL  ).to_crs(epsg=4326)
+    gdf_power    = gpd.read_file(SHP_POWER   ).to_crs(epsg=4326)
+    gdf_road     = gpd.read_file(SHP_ROAD    ).to_crs(epsg=4326)
+    print(f"      医院总数: {len(gdf_hospital)}，学校总数: {len(gdf_school)}")
+    print(f"      电力线总数: {len(gdf_power)}，道路总数: {len(gdf_road)}")
+
+    # ── Step 4：选取中高强度单次台风事件，提取风场 ────────────────────────────
+    print(f"\n[4/6] 遍历 {len(strong_events)} 个强台风事件，提取各节点最大风速…")
+
+    # 选取最接近目标风速（35 m/s）的台风事件
+    # [方向二] 选数据集中风速最强的台风事件
+    event_idx = strong_events[np.argmax(max_wind_per_event[strong_events])]
+    wind_field = intensity_dense[event_idx]
+    print(f"      当前分析台风最大风速: {wind_field.max():.2f} m/s")
+
+    track     = tracks.data[event_idx]
+    track_lon = track["lon"].values
+    track_lat = track["lat"].values
+
+    # ── Step 5：构建 centroid GeoDataFrame 并做空间匹配 ──────────────────────
+    print(f"\n[5/6] 构建风速 GeoDataFrame 并做空间匹配…")
+    affected_mask = wind_field > WIND_THRESHOLD
+    lon       = np.array(haz.centroids.lon)[affected_mask]
+    lat       = np.array(haz.centroids.lat)[affected_mask]
+    wind_vals = wind_field[affected_mask]
+    print(f"      受影响 centroid 数（> {WIND_THRESHOLD} m/s）: {affected_mask.sum()}")
+
+    if affected_mask.sum() == 0:
+        raise ValueError("没有任何 centroid 超过风速阈值，请检查 WIND_THRESHOLD 或 hazard 数据。")
+
+    # centroid 数过多时随机抽样，避免内存溢出
+    rng = np.random.default_rng(seed=42)
+    if len(lon) > 20000:
+        print(f"      centroid 数 {len(lon)} > 20000，随机抽样至 20000…")
+        idx       = rng.choice(len(lon), 20000, replace=False)
+        lon       = lon[idx]
+        lat       = lat[idx]
+        wind_vals = wind_vals[idx]
+
+    # 风速越大，缓冲半径越大，上限为 MAX_BUFFER
+    scales = wind_vals / WIND_THRESHOLD
+    radii  = np.minimum(BUFFER_DEG * scales, MAX_BUFFER)
+
+    affected_points = gpd.GeoDataFrame(
+        {"wind": wind_vals, "radius": radii},
+        geometry=[Point(x, y) for x, y in zip(lon, lat)],
+        crs="EPSG:4326"
+    )
+    affected_points["geometry_buf"] = affected_points.apply(
+        lambda row: row.geometry.buffer(row.radius), axis=1
+    )
+    affected_gdf_buf = gpd.GeoDataFrame(
+        affected_points[["wind"]],
+        geometry=affected_points["geometry_buf"],
+        crs="EPSG:4326"
+    )
+
+    # ── Step 6：空间相交 + [修改2/3/4/5] 概率计算与颜色映射 ─────────────────
+    print("\n[6/6] 空间相交 + Emanuel 损伤概率 + 颜色映射…")
+    print("道路范围:", gdf_road.total_bounds)
+    print("风场范围:", affected_gdf_buf.total_bounds)
+
+    def _intersect_with_wind(gdf, buffer_gdf):
+        """sjoin 找到受影响要素，并聚合取该要素覆盖区域内的最大风速。"""
+        joined = gpd.sjoin(gdf, buffer_gdf, how="inner", predicate="intersects")
+        max_wind_series = joined.groupby(joined.index)["wind"].max()
+        result = gdf.loc[max_wind_series.index].copy()
+        result["wind_max"] = max_wind_series.values
+        return result
+
+    hospital_impact = _intersect_with_wind(gdf_hospital, affected_gdf_buf)
+    school_impact   = _intersect_with_wind(gdf_school,   affected_gdf_buf)
+    power_impact    = _intersect_with_wind(gdf_power,    affected_gdf_buf)
+    road_impact     = _intersect_with_wind(gdf_road,     affected_gdf_buf)
+
+    # [方向二] Emanuel MDR 值域极小，线性拉伸到 [0,1] 再分级
+    all_winds = np.concatenate([
+        gdf_imp["wind_max"].values
+        for gdf_imp in [hospital_impact, school_impact, power_impact, road_impact]
+        if len(gdf_imp) > 0
+    ])
+    raw_probs = _wind_to_prob(all_winds.astype(float), impf)
+    prob_min, prob_max = raw_probs.min(), raw_probs.max()
+    print(f"      Emanuel MDR 原始范围: [{prob_min:.6f}, {prob_max:.6f}]")
+
+    offset = 0
+    for gdf_imp in [hospital_impact, school_impact, power_impact, road_impact]:
+        n = len(gdf_imp)
+        if n > 0:
+            raw = raw_probs[offset: offset + n]
+            if prob_max > prob_min:
+                # 线性拉伸：最小值→0，最大值→1
+                stretched = (raw - prob_min) / (prob_max - prob_min)
+            else:
+                stretched = np.zeros(n)
+            gdf_imp["damage_prob"] = stretched
+        else:
+            gdf_imp["damage_prob"] = []
+        offset += n
+
+    # [修改3/4] 颜色映射（点/线统一走离散红色分级）
+    def _assign_colors(gdf_imp, node_type):
+        if len(gdf_imp) == 0:
+            gdf_imp["color_hex"] = []
+            return
+        gdf_imp["color_hex"] = gdf_imp["damage_prob"].apply(
+            lambda p: _prob_to_color(float(p), node_type)
+        )
+
+    _assign_colors(hospital_impact, "hospital")
+    _assign_colors(school_impact,   "school")
+    _assign_colors(power_impact,    "power")
+    _assign_colors(road_impact,     "road")
+
+    # ── 损伤概率分布统计（诊断信息） ─────────────────────────────────────────
+    print("\n—— 当前台风事件损伤概率分布统计 ——")
+    print(f"事件ID: {event_idx}，最大风速: {wind_field.max():.2f} m/s\n")
+    for name, gdf_imp in [("道路", road_impact), ("电力", power_impact),
+                           ("医院", hospital_impact), ("学校", school_impact)]:
+        if len(gdf_imp) > 0:
+            probs = gdf_imp["damage_prob"].values
+            print(f"{name:4s} (受影响数量: {len(probs):5d}) :")
+            print(f"   min={probs.min():.4f}  max={probs.max():.4f}  "
+                  f"mean={probs.mean():.4f}  median={np.median(probs):.4f}")
+            print(f"   >0.2: {(probs > 0.2).mean():.1%}  >0.4: {(probs > 0.4).mean():.1%}  "
+                  f">0.6: {(probs > 0.6).mean():.1%}  >0.8: {(probs > 0.8).mean():.1%}\n")
+        else:
+            print(f"{name:4s}: 无受影响要素\n")
+
+    # ── 受损统计汇总 ──────────────────────────────────────────────────────────
+    print("—— 基础设施受损统计结果 ——")
+    print(f"  强台风事件数量:   {len(strong_events)}")
+    print(f"  受影响医院数量:   {len(hospital_impact)}")
+    print(f"  受影响学校数量:   {len(school_impact)}")
+    print(f"  受影响电力数量:   {len(power_impact)}")
+    print(f"  受影响道路数量:   {len(road_impact)}")
+
+    # [修改5] 输出 CSV
+    _save_csv(hospital_impact, "hospital_impact.csv")
+    _save_csv(school_impact,   "school_impact.csv")
+    _save_csv(power_impact,    "power_impact.csv")
+    _save_csv(road_impact,     "road_impact.csv")
+
+    _plot_impact(
+        gdf_hospital, gdf_school, gdf_power, gdf_road,
+        hospital_impact, school_impact, power_impact, road_impact,
+        affected_gdf_buf, event_idx,
+        track_lon, track_lat,
+        strong_events
+    )
+
+    return hospital_impact, school_impact, power_impact, road_impact
+
+
+# ── [修改5] CSV 输出工具 ──────────────────────────────────────────────────────
+def _save_csv(gdf_imp, filename: str):
+    """将 wind_max / damage_prob / color_hex 及质心坐标输出为 CSV。"""
+    if len(gdf_imp) == 0:
+        print(f"  [CSV] {filename}: 空，跳过")
+        return
+    cols = [c for c in ["wind_max", "damage_prob", "color_hex"] if c in gdf_imp.columns]
+    out  = gdf_imp[cols].copy()
+    try:
+        # 投影到 Web Mercator 计算质心，再转回经纬度
+        cent_geo = gpd.GeoSeries(
+            gdf_imp.to_crs(epsg=3857).geometry.centroid, crs=3857
+        ).to_crs(epsg=4326)
+        out["lon"] = cent_geo.x
+        out["lat"] = cent_geo.y
+    except Exception:
+        pass
+    save_path = DATA_DIR / filename
+    out.to_csv(save_path, index=True, encoding="utf-8-sig")
+    print(f"  [CSV] 已保存: {save_path}")
+
+
+# ── [修改3] 绘图函数 ──────────────────────────────────────────────────────────
+def _plot_impact(
+    gdf_hospital, gdf_school, gdf_power, gdf_road,
+    hospital_impact, school_impact, power_impact, road_impact,
+    affected_gdf_buf, event_idx,
+    track_lon, track_lat,
+    strong_events
+):
+    fig, ax = plt.subplots(figsize=(12, 11))
+
+    # 原本所有设施都使用浅灰色设置,现在改为用类型固定色，透明度降低以示"未受影响"
+    gdf_road.plot(ax=ax, color=TYPE_COLOR["road"], linewidth=0.4, zorder=1, label="_nolegend_")
+    gdf_power.plot(ax=ax, color=TYPE_COLOR["power"], linewidth=0.6, zorder=2, label="_nolegend_")
+    gdf_hospital.plot(ax=ax, color=TYPE_COLOR["hospital"], markersize=2, zorder=5, label="_nolegend_")
+    gdf_school.plot(ax=ax, color=TYPE_COLOR["school"], markersize=2, zorder=4, label="_nolegend_")
+
+    # 台风路径（仅显示窗口范围内的部分）
+    mask = (
+        (track_lon >= 108) & (track_lon <= 112) &
+        (track_lat >= 17)  & (track_lat <= 21)
+    )
+    ax.plot(track_lon[mask], track_lat[mask],
+            color="blue", linewidth=2, linestyle="--", zorder=6)
+
+    # 受影响设施：按颜色分组绘制，颜色由损伤概率决定
+    def _plot_colored_lines(gdf_imp, zorder, linewidth=0.6):
+        if len(gdf_imp) == 0:
+            return
+        for color, group in gdf_imp.groupby("color_hex"):
+            gpd.GeoDataFrame(group, geometry=group.geometry, crs=gdf_imp.crs).plot(
+                ax=ax, color=str(color), linewidth=linewidth, zorder=zorder
+            )
+
+    def _plot_colored_points(gdf_imp, zorder, markersize=3, marker="o"):
+        if len(gdf_imp) == 0:
+            return
+        for color, group in gdf_imp.groupby("color_hex"):
+            gpd.GeoDataFrame(group, geometry=group.geometry, crs=gdf_imp.crs).plot(
+                ax=ax, color=str(color), markersize=markersize,
+                marker=marker, zorder=zorder
+            )
+
+    _plot_colored_lines(road_impact,      zorder=2, linewidth=0.4)
+    _plot_colored_lines(power_impact,     zorder=3, linewidth=0.7)
+    _plot_colored_points(hospital_impact, zorder=5, markersize=1, marker="^")
+    _plot_colored_points(school_impact,   zorder=4, markersize=1, marker="o")
+
+    # 图例：类型固定色 + 5 级红色风险
+    type_handles = [
+        mlines.Line2D([], [], color="blue", linestyle="--", linewidth=2,
+                      label="台风路径（当前分析台风）"),
+        mlines.Line2D([], [], color=TYPE_COLOR["road"],
+                      linewidth=1.5, label=f"道路（无损  共{len(road_impact)}）"),
+        mlines.Line2D([], [], color=TYPE_COLOR["power"],
+                      linewidth=1.5, label=f"电力（无损  共{len(power_impact)}）"),
+        mlines.Line2D([], [], color=TYPE_COLOR["hospital"],
+                      marker="^", linestyle="None", markersize=6,
+                      label=f"医院（无损  共{len(hospital_impact)}）"),
+        mlines.Line2D([], [], color=TYPE_COLOR["school"],
+                      marker="o", linestyle="None", markersize=6,
+                      label=f"学校（无损  共{len(school_impact)}）"),
+    ]
+    risk_labels = [
+        "风险1 (0–0.2)", "风险2 (0.2–0.4)", "风险3 (0.4–0.6)",
+        "风险4 (0.6–0.8)", "风险5 (0.8–1.0)"
+    ]
+    risk_handles = [
+        mpatches.Patch(color=RED_LEVELS[i], label=risk_labels[i])
+        for i in range(5)
+    ]
+    ax.legend(
+        handles=type_handles + risk_handles,
+        loc="upper left", bbox_to_anchor=(1.02, 1.0),
+        fontsize=8, framealpha=0.85
+    )
+
+    ax.set_title(
+        f"台风风场影响下基础设施受损分布\n"
+        f"（单次台风事件分析，事件ID: {event_idx}，"
+        f"风速着色阈值 ≥ {WIND_THRESHOLD} m/s）",
+        fontsize=11, pad=14
+    )
+    ax.set_xlabel("经度")
+    ax.set_ylabel("纬度")
+    ax.set_xlim(108, 112)
+    ax.set_ylim(17, 21)
+    ax.set_aspect('equal')
+
+    plt.tight_layout()
+    plt.savefig("hainan_infra_impact.png", dpi=150, bbox_inches="tight")
+    print("\n图像已保存至 hainan_infra_impact.png")
+    plt.show()
+
+
+# ── 入口 ──────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    from climada.hazard import TropCyclone, TCTracks, Centroids
+
+    HAZARD_FILE = DATA_DIR / "hainan_tc_hazard_1980_2020.h5"
+    print(f"加载 Hazard: {HAZARD_FILE}")
+
+    if HAZARD_FILE.exists():
+        print("检测到本地 Hazard 文件，直接加载...")
+        haz = TropCyclone.from_hdf5(str(HAZARD_FILE))
+    else:
+        print("未找到 Hazard 文件，开始生成...")
+        cent = Centroids.from_pnt_bounds(
+            points_bounds=(108.5, 18.0, 111.5, 20.5),
+            res=0.02,
+        )
+        tracks = TCTracks.from_ibtracs_netcdf(
+            provider="usa", year_range=(1980, 2020),
+            basin="WP", estimate_missing=True,
+        )
+        print(f"读取轨迹数: {tracks.size}")
+        haz = TropCyclone.from_tracks(tracks, centroids=cent)
+        HAZARD_FILE.parent.mkdir(parents=True, exist_ok=True)
+        haz.write_hdf5(str(HAZARD_FILE))
+        print(f"Hazard 已生成并保存至: {HAZARD_FILE}")
+
+    print(f"Hazard 加载完毕：{haz.size} 事件，{haz.centroids.size} 质心")
+
+    tracks = TCTracks.from_ibtracs_netcdf(
+        provider="usa", year_range=(1980, 2020),
+        basin="WP", estimate_missing=True,
+    )
+    print(f"轨迹数量: {tracks.size}")
+
+    hospital_impact, school_impact, power_impact, road_impact = \
+        analyze_infrastructure_impact(haz, tracks)
