@@ -1,0 +1,973 @@
+"""
+台风风场影响下的基础设施受损识别脚本
+CMIP6 SSP245 vs SSP585 双情景对比版本
+
+重构说明（相对于 SSP585 单情景版本）
+——————————————————————————————————————————————————————————————
+[重构1] 新增 SSP245 情景配置（ScenarioConfig）
+[重构2] load_cmip6_data() 按情景名称分支设置气候参数
+[重构3] generate_future_tc_tracks() 统一使用 seed=42，保证可比性
+[重构4] analyze_infrastructure_impact() 删除 np.random.choice，
+         改为基于第90百分位的强台风代表事件选择
+[重构5] 主程序改为循环两个情景，收集 summary 并输出对比 CSV
+[重构6] 输出文件/图像按情景命名区分
+——————————————————————————————————————————————————————————————
+保留函数（仅最小修改）：
+  _assign_damage_times()
+  _plot_impact()
+  _save_csv()
+"""
+
+# ── 全局导入 ──────────────────────────────────────────────────────────────────
+import numpy as np
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
+import matplotlib.patches as mpatches
+import xarray as xr
+import pandas as pd
+from dataclasses import dataclass
+from pathlib import Path
+from shapely.geometry import Point
+
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial Unicode MS']
+plt.rcParams['axes.unicode_minus'] = False
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 一、情景配置类
+
+@dataclass
+class ScenarioConfig:
+    """CMIP6 SSP 情景配置。
+
+    Parameters
+    ----------
+    name           : 情景名称，如 "SSP585" 或 "SSP245"
+    gcm            : 全球气候模式名称，如 "ACCESS-CM2"
+    ensemble       : 集成成员编号，如 "r1i1p1f1"
+    baseline_period: 基准气候期（起止年份），如 (1981, 2010)
+    future_period  : 未来气候期（起止年份），如 (2031, 2060)
+    region_bounds  : 研究区域边界 (lon_min, lat_min, lon_max, lat_max)
+    """
+    name:            str
+    gcm:             str
+    ensemble:        str
+    baseline_period: tuple
+    future_period:   tuple
+    region_bounds:   tuple   # (lon_min, lat_min, lon_max, lat_max)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 二、路径与参数配置
+
+DATA_DIR       = Path(r"D:\climada_hainan_energy")
+WIND_THRESHOLD = 17.5   # 风速阈值（m/s），低于此值的 centroid 不参与匹配
+BUFFER_DEG     = 0.05   # 空间缓冲半径基础值（度）
+MAX_BUFFER     = 0.08   # 空间缓冲半径上限（度）
+
+SHP_HOSPITAL = DATA_DIR / "海南省医院shp.shp"
+SHP_SCHOOL   = DATA_DIR / "海南省学校shp.shp"
+SHP_POWER    = DATA_DIR / "海南省电力shp.shp"
+SHP_ROAD     = DATA_DIR / "海南省道路shp.shp"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 三、颜色配置（保持不变）
+
+TYPE_COLOR = {
+    "hospital": "#35903A",
+    "school":   "#8363A1",
+    "power":    "#206E9E",
+    "road":     "#E47B26",
+}
+
+RED_LEVELS = [
+    "#FE5757",
+    "#EA1E20",
+    "#BE0208",
+    "#9C000D",
+    "#790105",
+]
+
+
+def _prob_to_color(prob: float, node_type: str) -> str:
+    """将损伤概率映射为显示颜色：无损伤返回类型固定色，有损伤返回对应红色级别。"""
+    if prob <= 0:
+        return TYPE_COLOR[node_type]
+    level = min(int(prob * 4), 4)   # [0, 1] → 离散级别 0–4
+    return RED_LEVELS[level]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 四、脆弱性函数工具（保持不变）
+
+def _build_impf():
+    """构建 ImpfTropCyclone Emanuel USA 脆弱性函数并返回。"""
+    from climada.entity.impact_funcs.trop_cyclone import ImpfTropCyclone
+    return ImpfTropCyclone.from_emanuel_usa()
+
+
+def _wind_to_prob(wind_ms: np.ndarray, impf) -> np.ndarray:
+    """将风速数组（m/s）转换为损伤概率数组（MDR，值域 [0, 1]）。"""
+    return impf.calc_mdr(wind_ms)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 五、CMIP6 数据读取
+# [重构2] 按情景名称分支设置气候参数（SSP585 vs SSP245）
+
+def load_cmip6_data(cfg: ScenarioConfig) -> dict:
+    """
+    读取 CMIP6 气候要素（SST / 风切变 / SLP）。
+
+    实际生产中应从 NetCDF 文件读取，路径示例：
+        /data/cmip6/{cfg.gcm}/{cfg.ensemble}/sst_{cfg.name.lower()}_*.nc
+
+    当前实现使用随机数替代，但数据结构与真实场景完全一致：
+      - sst       : 海面温度（℃ 异常），shape (lat, lon)
+      - wind_shear: 200–850 hPa 垂直风切变（m/s），shape (lat, lon)
+      - slp       : 海平面气压（hPa 异常），shape (lat, lon)
+
+    [重构2] 关键修改：
+      SSP585 → future_warming=1.1, shear_mean=8.5
+      SSP245 → future_warming=0.6, shear_mean=7.8
+      两个情景使用相同随机种子 seed=2085，差异仅来自气候参数
+
+    Parameters
+    ----------
+    cfg : ScenarioConfig
+
+    Returns
+    -------
+    dict with keys: "sst", "wind_shear", "slp", "lons", "lats"
+      每个值均为 numpy.ndarray，shape (100, 100)
+    """
+    lon_min, lat_min, lon_max, lat_max = cfg.region_bounds
+
+    # ── 构建空间网格（与真实 CMIP6 格点结构一致） ────────────────────────────
+    n_lat, n_lon = 100, 100
+    lons = np.linspace(lon_min - 5, lon_max + 5, n_lon)   # 扩展研究区外围
+    lats = np.linspace(lat_min - 5, lat_max + 5, n_lat)
+
+    rng = np.random.default_rng(seed=2085)   # 固定种子保证可复现
+
+    # ── [重构2] 按情景分支设置气候参数 ──────────────────────────────────────
+    if cfg.name == "SSP585":
+        future_warming = 1.1   # ℃，SSP585 升温较强
+        shear_mean     = 8.5   # m/s，SSP585 风切变略大
+    elif cfg.name == "SSP245":
+        future_warming = 0.6   # ℃，SSP245 升温较弱
+        shear_mean     = 7.8   # m/s，SSP245 风切变略小
+    else:
+        # 默认回退（兼容其他情景名称）
+        future_warming = 0.8
+        shear_mean     = 8.0
+
+    # ── SST：未来升温背景 + 空间变率（单位：℃ 相对基准期） ──────────────────
+    sst_anomaly = (
+        rng.normal(loc=future_warming, scale=0.4, size=(n_lat, n_lon))
+        + 0.3 * np.sin(np.linspace(0, np.pi, n_lon))    # 纬向变率
+    )
+
+    # ── 风切变：热带气旋活跃区风切变（m/s） ─────────────────────────────────
+    wind_shear = rng.normal(loc=shear_mean, scale=2.0, size=(n_lat, n_lon))
+    wind_shear = np.clip(wind_shear, 0, 25)
+
+    # ── SLP：低值系统频率（hPa 负异常代表深对流活跃） ────────────────────────
+    slp_anomaly = rng.normal(loc=-0.5, scale=1.2, size=(n_lat, n_lon))
+
+    print(f"  [CMIP6] 模式: {cfg.gcm} / {cfg.ensemble} / {cfg.name}")
+    print(f"  [CMIP6] 未来期: {cfg.future_period[0]}–{cfg.future_period[1]}")
+    print(f"  [CMIP6] 设定升温: {future_warming} ℃  风切变均值: {shear_mean} m/s")
+    print(f"  [CMIP6] SST 升温均值: {sst_anomaly.mean():.2f} ℃  "
+          f"风切变均值: {wind_shear.mean():.2f} m/s")
+
+    return {
+        "sst":        sst_anomaly,
+        "wind_shear": wind_shear,
+        "slp":        slp_anomaly,
+        "lons":       lons,
+        "lats":       lats,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 六、未来台风轨迹生成（核心）
+# [重构3] 统一使用 seed=42，保证两个情景随机性可比
+
+def generate_future_tc_tracks(cfg: ScenarioConfig, climate_data: dict):
+    """
+    基于 CMIP6 气候要素生成未来台风轨迹集合。
+
+    物理假设（与文献一致）：
+      - SSP585/SSP245 情景下 WNP 台风强度受 SST 和风切变调制
+      - 路径生成：从初始位置沿随机游走轨迹移动，受引导气流约束
+      - 台风生命期：72–168 h（3–7天）
+      - 生成台风数：50–200 条（由区域气候条件决定）
+
+    [重构3] 关键约束：
+      rng = np.random.default_rng(seed=42)
+      两个情景使用完全相同的随机种子，保证可比性
+      差异仅来自 intensity_factor（由 SST/风切变驱动）
+
+    Parameters
+    ----------
+    cfg          : ScenarioConfig
+    climate_data : dict，来自 load_cmip6_data()
+
+    Returns
+    -------
+    climada.hazard.TCTracks
+      每条轨迹包含 time / lon / lat / max_sustained_wind / time_step 变量
+    """
+    from climada.hazard import TCTracks
+
+    lon_min, lat_min, lon_max, lat_max = cfg.region_bounds
+    sst_mean        = climate_data["sst"].mean()
+    wind_shear_mean = climate_data["wind_shear"].mean()
+
+    # ── 气候条件对台风活动的调制因子 ─────────────────────────────────────────
+    # SST 越高、风切变越低，台风生成数越多、强度越强
+    intensity_factor = 1.0 + 0.12 * sst_mean - 0.03 * (wind_shear_mean - 8.0)
+    intensity_factor = np.clip(intensity_factor, 0.85, 1.35)
+
+    # 台风数量：基准 100 条，由气候调制因子调整
+    n_tracks = int(np.clip(100 * intensity_factor, 50, 200))
+
+    print(f"\n  [轨迹生成] 情景: {cfg.name}")
+    print(f"  [轨迹生成] SST均值: {sst_mean:.2f}℃  风切变均值: {wind_shear_mean:.2f} m/s")
+    print(f"  [轨迹生成] 强度调制因子: {intensity_factor:.3f}")
+    print(f"  [轨迹生成] 计划生成台风数: {n_tracks}")
+
+    # [重构3] 统一使用 seed=42，两情景随机过程完全一致
+    rng = np.random.default_rng(seed=42)
+
+    # ── 未来气候期时间轴（用于 time 字段，仅年份有物理意义） ─────────────────
+    year_start, year_end = cfg.future_period
+    future_years = np.arange(year_start, year_end + 1)
+
+    # ── 台风季节月份（6–11 月，峰值 8–10 月） ────────────────────────────────
+    month_weights = np.array([0.02, 0.06, 0.16, 0.28, 0.26, 0.16, 0.06])  # 6–12月
+    month_choices = np.arange(6, 13)
+
+    datasets = []   # 存储每条轨迹的 xarray.Dataset
+
+    for i in range(n_tracks):
+        # ── 随机选取年份与月份 ───────────────────────────────────────────────
+        year  = rng.choice(future_years)
+        month = rng.choice(month_choices, p=month_weights / month_weights.sum())
+
+        # ── 台风生命期：72–168 h，步长 3 h ──────────────────────────────────
+        duration_h = int(rng.integers(72, 169, endpoint=True))
+        dt_h       = 3
+        n_steps    = duration_h // dt_h + 1
+
+        # ── 时间轴（xarray 要求 datetime64） ────────────────────────────────
+        t0     = np.datetime64(f"{year}-{month:02d}-{rng.integers(1, 25):02d}T00")
+        times  = np.array([t0 + np.timedelta64(k * dt_h, 'h') for k in range(n_steps)])
+
+        # ── 初始位置：在研究区域外围生成，路径穿越研究区 ─────────────────────
+        init_lon = rng.uniform(lon_min - 3, lon_max + 3)
+        init_lat = rng.uniform(lat_min - 2, lat_max + 1)
+
+        # ── 路径生成：随机游走 + 主导移向（WNP 台风主体北偏西移） ───────────
+        dx_mean = rng.uniform(-0.20, 0.05)   # 西移分量（负值）
+        dy_mean = rng.uniform( 0.05, 0.20)   # 北移分量（正值）
+
+        dx = rng.normal(dx_mean, 0.08, n_steps)   # 经度增量
+        dy = rng.normal(dy_mean, 0.06, n_steps)   # 纬度增量
+
+        lons_track = init_lon + np.cumsum(dx)
+        lats_track = init_lat + np.cumsum(dy)
+
+        # ── 最大风速时序（knots）── 生命期抛物线廓型 ─────────────────────────
+        # 基准 40–80 kt，乘以强度调制因子（SSP585 > SSP245）
+        vmax_peak_kt = rng.uniform(40, 85) * intensity_factor
+        vmax_peak_kt = np.clip(vmax_peak_kt, 30, 120)
+
+        # 生命期抛物线：发展→成熟→衰减
+        t_norm    = np.linspace(0, 1, n_steps)
+        peak_pos  = rng.uniform(0.3, 0.55)         # 峰值在生命期的相对位置
+        vmax_curve = np.exp(-((t_norm - peak_pos) / 0.25) ** 2)
+        vmax_track = (
+            vmax_peak_kt * vmax_curve
+            + rng.normal(0, 2.0, n_steps)           # 随机扰动
+        ).clip(15, 150)
+
+        # ── 根据最大风速计算台风等级（category） ─────────────────────────────
+        vmax_max = vmax_track.max()  # 单位：knots
+
+        if vmax_max < 34:
+            cat = -1  # 热带低压
+        elif vmax_max < 64:
+            cat = 0   # 热带风暴
+        elif vmax_max < 83:
+            cat = 1
+        elif vmax_max < 96:
+            cat = 2
+        elif vmax_max < 113:
+            cat = 3
+        elif vmax_max < 137:
+            cat = 4
+        else:
+            cat = 5
+
+        # ── 构建 xarray.Dataset ────────────────────────────────────────────
+        time_step_arr    = np.full(len(times), dt_h, dtype=np.float32)
+        env_pressure     = np.full(n_steps, 1010.0, dtype=np.float32)
+        central_pressure = (1010 - (vmax_track * 0.8)).clip(850, 1010)
+        rmw              = np.full(n_steps, 30.0, dtype=np.float32)
+
+        ds = xr.Dataset(
+            {
+                "max_sustained_wind":    ("time", vmax_track.astype(np.float32)),
+                "lon":                   ("time", lons_track.astype(np.float32)),
+                "lat":                   ("time", lats_track.astype(np.float32)),
+                "time_step":             ("time", time_step_arr),
+                "environmental_pressure":("time", env_pressure),
+                "central_pressure":      ("time", central_pressure.astype(np.float32)),
+                "radius_max_wind":       ("time", rmw),
+                "basin":                 ("time", np.array(["WP"] * len(times))),
+            },
+            coords={"time": times},
+        )
+        ds.attrs["max_sustained_wind_unit"]     = "knots"
+        ds.attrs["central_pressure_unit"]       = "hPa"
+        ds.attrs["environmental_pressure_unit"] = "hPa"
+        ds.attrs["radius_max_wind_unit"]        = "km"
+
+        # CLIMADA TCTracks 额外需要的属性
+        ds.attrs["sid"]             = f"{cfg.name}_{cfg.gcm}_{year}{month:02d}_{i:04d}"
+        ds.attrs["name"]            = f"FUTURE_TC_{i:04d}"
+        ds.attrs["orig_event_flag"] = True
+        ds.attrs["basin"]           = "WP"
+        ds.attrs["category"]        = int(cat)
+        datasets.append(ds)
+
+    # ── 封装为 TCTracks ───────────────────────────────────────────────────────
+    tc_tracks      = TCTracks()
+    tc_tracks.data = datasets
+
+    all_vmax = np.concatenate([
+        ds["max_sustained_wind"].values for ds in datasets
+    ])
+    print(f"  [轨迹生成] 实际生成台风数: {len(datasets)}")
+    print(f"  [轨迹生成] 最大风速范围: "
+          f"{all_vmax.min():.1f} – {all_vmax.max():.1f} knots")
+    print(f"  [轨迹生成] 最大风速均值: {all_vmax.mean():.1f} knots")
+
+    return tc_tracks
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 七、构建未来 Hazard
+
+def build_future_hazard(cfg: ScenarioConfig):
+    """
+    基于 CMIP6 情景配置构建未来台风危险性 Hazard。
+
+    流程：
+      1. load_cmip6_data()              → 读取 CMIP6 气候要素
+      2. generate_future_tc_tracks()    → 生成未来台风轨迹集合
+      3. Centroids.from_pnt_bounds()    → 建立研究区 centroid 网格
+      4. TropCyclone.from_tracks()      → 计算风场、生成 Hazard
+
+    Parameters
+    ----------
+    cfg : ScenarioConfig
+
+    Returns
+    -------
+    haz    : climada.hazard.TropCyclone
+    tracks : climada.hazard.TCTracks
+    """
+    from climada.hazard import TropCyclone, Centroids
+
+    print(f" 构建未来 Hazard：{cfg.name} / {cfg.gcm} / {cfg.ensemble}")
+    print(f" 未来气候期：{cfg.future_period[0]}–{cfg.future_period[1]}")
+
+    print("\n[Step 1] 加载 CMIP6 气候要素…")
+    climate_data = load_cmip6_data(cfg)
+
+    print("\n[Step 2] 生成未来台风轨迹…")
+    tracks = generate_future_tc_tracks(cfg, climate_data)
+    print(f"  轨迹总数: {tracks.size}")
+
+    print("\n[Step 3] 构建研究区 Centroid 网格…")
+    cent = Centroids.from_pnt_bounds(
+        points_bounds=cfg.region_bounds,
+        res=0.02,
+    )
+    print(f"  Centroid 数: {cent.size}")
+
+    print("\n[Step 4] 计算台风风场（TropCyclone.from_tracks）…")
+    haz = TropCyclone.from_tracks(
+        tracks,
+        centroids=cent,
+        store_windfields=False,
+    )
+    print(f"  Hazard 事件数: {haz.size}  Centroid 数: {haz.centroids.size}")
+
+    return haz, tracks
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 八、时间维度分析（保持不变）
+
+def _assign_damage_times(gdf_imp: gpd.GeoDataFrame,
+                         haz,
+                         event_idx: int,
+                         track,
+                         threshold: float = WIND_THRESHOLD):
+    """
+    利用 Holland 简化模型从台风轨迹重建各设施处风速时间序列，
+    求 damage_time（首次超阈时刻）与 peak_time（峰值风速时刻）。
+    """
+    if len(gdf_imp) == 0:
+        gdf_imp["damage_time"] = []
+        gdf_imp["peak_time"]   = []
+        return
+
+    times   = track["time"].values
+    t_lon   = track["lon"].values
+    t_lat   = track["lat"].values
+    t_vmax  = track["max_sustained_wind"].values
+    print(f"[诊断] max_sustained_wind 范围: {t_vmax.min():.1f} ~ {t_vmax.max():.1f}")
+
+    t_vmax_ms = t_vmax * 0.5144   # knots → m/s
+    T = len(times)
+
+    cent_lon = np.array(haz.centroids.lon)
+    cent_lat = np.array(haz.centroids.lat)
+
+    cent_series = gpd.GeoSeries(
+        gdf_imp.to_crs(epsg=3857).geometry.centroid, crs=3857
+    ).to_crs(epsg=4326)
+    fac_lon = cent_series.x.values
+    fac_lat = cent_series.y.values
+
+    cent_near_idx = np.array([
+        int(np.argmin((cent_lon - fx)**2 + (cent_lat - fy)**2))
+        for fx, fy in zip(fac_lon, fac_lat)
+    ])
+    fac_lon_snap = cent_lon[cent_near_idx]
+    fac_lat_snap = cent_lat[cent_near_idx]
+
+    def _haversine_km(lon1, lat1, lon2_arr, lat2_arr):
+        R    = 6371.0
+        dlat = np.radians(lat2_arr - lat1)
+        dlon = np.radians(lon2_arr - lon1)
+        a    = (np.sin(dlat / 2)**2
+                + np.cos(np.radians(lat1))
+                * np.cos(np.radians(lat2_arr))
+                * np.sin(dlon / 2)**2)
+        return R * 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+
+    RMAX_KM  = 50.0
+    M        = len(fac_lon_snap)
+    v_matrix = np.zeros((T, M), dtype=np.float32)
+
+    for t in range(T):
+        if t_vmax_ms[t] <= 0:
+            continue
+        dist_km = _haversine_km(t_lon[t], t_lat[t], fac_lon_snap, fac_lat_snap)
+        dist_km = np.maximum(dist_km, 1.0)
+        ratio   = RMAX_KM / dist_km
+        v_matrix[t] = t_vmax_ms[t] * ratio * np.exp(0.5 * (1.0 - ratio**2))
+
+    damage_times = []
+    peak_times   = []
+
+    for m in range(M):
+        v_series = v_matrix[:, m]
+        exceed   = np.where(v_series >= threshold)[0]
+        if len(exceed) > 0:
+            t_str = str(np.datetime64(times[exceed[0]], 'm')).replace('T', ' ')
+            damage_times.append(t_str)
+        else:
+            damage_times.append(float('nan'))
+
+        peak_step = int(np.argmax(v_series))
+        t_str = str(np.datetime64(times[peak_step], 'm')).replace('T', ' ')
+        peak_times.append(t_str)
+
+    gdf_imp["damage_time"] = damage_times
+    gdf_imp["peak_time"]   = peak_times
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 九、主分析函数
+# [重构4] 删除 np.random.choice，改为第90百分位强台风代表事件选择
+# [重构6] 增加 scenario_name 参数用于文件/图像命名
+
+def analyze_infrastructure_impact(haz, tracks, scenario_name: str = "SSP585", event_id: int = None):
+    """
+    基础设施损伤分析主函数。
+
+    [重构4] 事件选择策略变更：
+      删除：event_idx = np.random.choice(range(haz.size))
+      改为：基于第90百分位的强台风代表事件选择
+        max_wind_per_event = haz.intensity.toarray().max(axis=1)
+        threshold = np.percentile(max_wind_per_event, 90)
+        event_candidates = np.where(max_wind_per_event >= threshold)[0]
+        event_idx = event_candidates[0]
+
+    Parameters
+    ----------
+    haz           : climada.hazard.TropCyclone
+    tracks        : climada.hazard.TCTracks
+    scenario_name : str，情景名称（用于输出文件命名），如 "SSP245"、"SSP585"
+
+    Returns
+    -------
+    hospital_impact, school_impact, power_impact, road_impact : GeoDataFrame
+    """
+
+    # ── Step 1：强台风诊断 ────────────────────────────────────────────────────
+    print("[1/7] 筛选强台风事件（max_wind ≥ 30 m/s）…")
+    intensity_dense  = haz.intensity.toarray()
+    print(f"      事件总数: {intensity_dense.shape[0]}，Centroid 数: {intensity_dense.shape[1]}")
+
+    max_wind_per_event = intensity_dense.max(axis=1)
+    strong_events      = np.where(max_wind_per_event >= 30)[0]
+    print(f"      满足条件的强台风事件数（≥30 m/s）: {len(strong_events)}")
+
+    if haz.size == 0:
+        raise ValueError("Hazard 中无任何事件，请检查轨迹生成逻辑。")
+
+    # ── Step 2：初始化 Emanuel 脆弱性函数 ────────────────────────────────────
+    print("\n[2/7] 加载 Emanuel Sigmoid 脆弱性函数…")
+    impf = _build_impf()
+
+    # ── Step 3：读取基础设施 shapefile ────────────────────────────────────────
+    print("\n[3/7] 读取基础设施 shp 文件…")
+    gdf_hospital = gpd.read_file(SHP_HOSPITAL).to_crs(epsg=4326)
+    gdf_school   = gpd.read_file(SHP_SCHOOL  ).to_crs(epsg=4326)
+    gdf_power    = gpd.read_file(SHP_POWER   ).to_crs(epsg=4326)
+    gdf_road     = gpd.read_file(SHP_ROAD    ).to_crs(epsg=4326)
+    print(f"      医院总数: {len(gdf_hospital)}，学校总数: {len(gdf_school)}")
+    print(f"      电力线总数: {len(gdf_power)}，道路总数: {len(gdf_road)}")
+
+    # ── Step 4：[重构4] 基于第90百分位选取强台风代表事件 ─────────────────────
+    print(f"\n[4/7] 选取第90百分位强台风代表事件（{scenario_name}）…")
+    threshold_90   = np.percentile(max_wind_per_event, 90)
+    event_candidates = np.where(max_wind_per_event >= threshold_90)[0]
+
+    print(f"      第90百分位风速阈值: {threshold_90:.2f} m/s")
+    print(f"      候选强台风数量: {len(event_candidates)}")
+
+    if len(event_candidates) == 0:
+        print("没有满足条件的强台风，返回空结果。")
+        empty_gdf = gpd.GeoDataFrame()
+        return empty_gdf, empty_gdf, empty_gdf, empty_gdf
+
+    # —— 优先使用手动指定事件ID ——
+    if event_id is not None:
+        if event_id >= len(strong_events):
+            raise ValueError(f"强台风索引超出范围（最大={len(strong_events) - 1}）")
+        event_idx = strong_events[event_id]
+        print(f"      [第{event_id}个强台风] 实际事件ID: {event_idx}")
+    else:
+        event_idx = event_candidates[0]
+        print(f"      [默认90分位] 选取事件 ID: {event_idx}")
+
+    wind_field = intensity_dense[event_idx]
+    print(f"最大风速: {wind_field.max():.2f} m/s")
+
+    track     = tracks.data[event_idx]
+    track_lon = track["lon"].values
+    track_lat = track["lat"].values
+
+    # ── Step 5：构建 centroid GeoDataFrame 并做空间匹配 ──────────────────────
+    print(f"\n[5/7] 构建风速 GeoDataFrame 并做空间匹配…")
+    affected_mask = wind_field > WIND_THRESHOLD
+    lon       = np.array(haz.centroids.lon)[affected_mask]
+    lat       = np.array(haz.centroids.lat)[affected_mask]
+    wind_vals = wind_field[affected_mask]
+    print(f"受影响 centroid 数（> {WIND_THRESHOLD} m/s）: {affected_mask.sum()}")
+
+    if affected_mask.sum() == 0:
+        print(
+            f"\n[无效台风] 事件ID: {event_idx} 未影响研究区"
+            f"（max_wind = {wind_field.max():.2f} m/s）"
+        )
+        empty_gdf = gpd.GeoDataFrame()
+        return empty_gdf, empty_gdf, empty_gdf, empty_gdf
+
+    rng_sample = np.random.default_rng(seed=42)
+    if len(lon) > 20000:
+        print(f"      centroid 数 {len(lon)} > 20000，随机抽样至 20000…")
+        idx       = rng_sample.choice(len(lon), 20000, replace=False)
+        lon       = lon[idx]
+        lat       = lat[idx]
+        wind_vals = wind_vals[idx]
+
+    scales = wind_vals / WIND_THRESHOLD
+    radii  = np.minimum(BUFFER_DEG * scales, MAX_BUFFER)
+
+    affected_points = gpd.GeoDataFrame(
+        {"wind": wind_vals, "radius": radii},
+        geometry=[Point(x, y) for x, y in zip(lon, lat)],
+        crs="EPSG:4326"
+    )
+    affected_points["geometry_buf"] = affected_points.apply(
+        lambda row: row.geometry.buffer(row.radius), axis=1
+    )
+    affected_gdf_buf = gpd.GeoDataFrame(
+        affected_points[["wind"]],
+        geometry=affected_points["geometry_buf"],
+        crs="EPSG:4326"
+    )
+
+    # ── Step 6：空间相交 + Emanuel损伤概率 + 颜色映射 ────────────────────────
+    print("\n[6/7] 空间相交 + Emanuel 损伤概率 + 颜色映射…")
+    print("道路范围:", gdf_road.total_bounds)
+    print("风场范围:", affected_gdf_buf.total_bounds)
+
+    def _intersect_with_wind(gdf, buffer_gdf):
+        joined = gpd.sjoin(gdf, buffer_gdf, how="inner", predicate="intersects")
+        max_wind_series = joined.groupby(joined.index)["wind"].max()
+        result = gdf.loc[max_wind_series.index].copy()
+        result["wind_max"] = max_wind_series.values
+        return result
+
+    hospital_impact = _intersect_with_wind(gdf_hospital, affected_gdf_buf)
+    school_impact   = _intersect_with_wind(gdf_school,   affected_gdf_buf)
+    power_impact    = _intersect_with_wind(gdf_power,    affected_gdf_buf)
+    road_impact     = _intersect_with_wind(gdf_road,     affected_gdf_buf)
+
+    wind_list = [
+        gdf_imp["wind_max"].values
+        for gdf_imp in [hospital_impact, school_impact, power_impact, road_impact]
+        if len(gdf_imp) > 0
+    ]
+
+    if len(wind_list) == 0:
+        print(f"\n[警告] 事件ID {event_idx} 未影响任何基础设施，跳过该事件")
+        empty_gdf = gpd.GeoDataFrame()
+        return empty_gdf, empty_gdf, empty_gdf, empty_gdf
+
+    all_winds = np.concatenate(wind_list)
+
+    raw_probs = _wind_to_prob(all_winds.astype(float), impf)
+    prob_min, prob_max = raw_probs.min(), raw_probs.max()
+    print(f"      Emanuel MDR 原始范围: [{prob_min:.6f}, {prob_max:.6f}]")
+
+    offset = 0
+    for gdf_imp in [hospital_impact, school_impact, power_impact, road_impact]:
+        n = len(gdf_imp)
+        if n > 0:
+            raw = raw_probs[offset: offset + n]
+            if prob_max > prob_min:
+                stretched = (raw - prob_min) / (prob_max - prob_min)
+            else:
+                stretched = np.zeros(n)
+            gdf_imp["damage_prob"] = stretched
+        else:
+            gdf_imp["damage_prob"] = []
+        offset += n
+
+    # 时间维度
+    print("\n[7/7] 计算各设施 damage_time / peak_time…")
+    for _gdf_imp in [hospital_impact, school_impact, power_impact, road_impact]:
+        _assign_damage_times(_gdf_imp, haz, event_idx, track)
+    print("时间字段写入完毕")
+
+    # 颜色映射
+    def _assign_colors(gdf_imp, node_type):
+        if len(gdf_imp) == 0:
+            gdf_imp["color_hex"] = []
+            return
+        gdf_imp["color_hex"] = gdf_imp["damage_prob"].apply(
+            lambda p: _prob_to_color(float(p), node_type)
+        )
+
+    _assign_colors(hospital_impact, "hospital")
+    _assign_colors(school_impact,   "school")
+    _assign_colors(power_impact,    "power")
+    _assign_colors(road_impact,     "road")
+
+    # 损伤概率分布统计
+    print(f"\n—— {scenario_name} 当前台风事件损伤概率分布统计 ——")
+    print(f"事件ID: {event_idx}，最大风速: {wind_field.max():.2f} m/s\n")
+    for name, gdf_imp in [("道路", road_impact), ("电力", power_impact),
+                           ("医院", hospital_impact), ("学校", school_impact)]:
+        if len(gdf_imp) > 0:
+            probs = gdf_imp["damage_prob"].values
+            print(f"{name:1s} (受影响数量: {len(probs):1d}) :")
+            print(f"   min={probs.min():.4f}  max={probs.max():.4f}  "
+                  f"mean={probs.mean():.4f}  median={np.median(probs):.4f}")
+            print(f"   >0.2: {(probs > 0.2).mean():.1%}  >0.4: {(probs > 0.4).mean():.1%}  "
+                  f">0.6: {(probs > 0.6).mean():.1%}  >0.8: {(probs > 0.8).mean():.1%}\n")
+        else:
+            print(f"{name:4s}: 无受影响要素\n")
+
+    print(f"—— {scenario_name} 基础设施受损统计结果 ——")
+    print(f"  强台风事件数量: {len(strong_events)}")
+    print(f"  受影响医院数量: {len(hospital_impact)}")
+    print(f"  受影响学校数量: {len(school_impact)}")
+    print(f"  受影响电力数量: {len(power_impact)}")
+    print(f"  受影响道路数量: {len(road_impact)}")
+
+    # [重构6] 输出 CSV，按情景命名
+    scenario_lower = scenario_name.lower()
+    _save_csv(hospital_impact, f"hospital_impact_{scenario_lower}.csv")
+    _save_csv(school_impact,   f"school_impact_{scenario_lower}.csv")
+    _save_csv(power_impact,    f"power_impact_{scenario_lower}.csv")
+    _save_csv(road_impact,     f"road_impact_{scenario_lower}.csv")
+
+    # [重构6] 绘图，按情景命名
+    _plot_impact(
+        gdf_hospital, gdf_school, gdf_power, gdf_road,
+        hospital_impact, school_impact, power_impact, road_impact,
+        affected_gdf_buf, event_idx,
+        track_lon, track_lat,
+        strong_events,
+        scenario_name=scenario_name
+    )
+
+    return hospital_impact, school_impact, power_impact, road_impact
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 十、CSV 输出工具（保持不变）
+
+def _save_csv(gdf_imp, filename: str):
+    """将 wind_max / damage_prob / color_hex 及质心坐标输出为 CSV。"""
+    if len(gdf_imp) == 0:
+        print(f"  [CSV] {filename}: 空，跳过")
+        return
+    cols = [c for c in ["wind_max", "damage_prob", "color_hex",
+                        "damage_time", "peak_time"] if c in gdf_imp.columns]
+    out  = gdf_imp[cols].copy()
+    try:
+        cent_geo = gpd.GeoSeries(
+            gdf_imp.to_crs(epsg=3857).geometry.centroid, crs=3857
+        ).to_crs(epsg=4326)
+        out["lon"] = cent_geo.x
+        out["lat"] = cent_geo.y
+    except Exception:
+        pass
+    save_path = DATA_DIR / filename
+    out.to_csv(save_path, index=True, encoding="utf-8-sig")
+    print(f"  [CSV] 已保存: {save_path}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 十一、绘图函数
+# [重构6] 增加 scenario_name 参数，标题和文件名按情景区分
+
+def _plot_impact(
+    gdf_hospital, gdf_school, gdf_power, gdf_road,
+    hospital_impact, school_impact, power_impact, road_impact,
+    affected_gdf_buf, event_idx,
+    track_lon, track_lat,
+    strong_events,
+    scenario_name: str = "SSP585"
+):
+    """
+    绘制基础设施受损分布图。
+
+    [重构6] 标题与输出文件名均包含情景名称：
+      hainan_infra_impact_ssp245.png
+      hainan_infra_impact_ssp585.png
+    """
+    fig, ax = plt.subplots(figsize=(14, 11))
+    plt.subplots_adjust(right=0.78, top=0.92)
+
+    gdf_road.plot(ax=ax, color=TYPE_COLOR["road"], linewidth=0.4, zorder=1, label="_nolegend_")
+    gdf_power.plot(ax=ax, color=TYPE_COLOR["power"], linewidth=0.6, zorder=2, label="_nolegend_")
+    gdf_hospital.plot(ax=ax, color=TYPE_COLOR["hospital"], markersize=2, zorder=5, label="_nolegend_")
+    gdf_school.plot(ax=ax, color=TYPE_COLOR["school"], markersize=2, zorder=4, label="_nolegend_")
+
+    # 台风路径（仅显示窗口范围内的部分）
+    mask = (
+        (track_lon >= 108) & (track_lon <= 112) &
+        (track_lat >= 17)  & (track_lat <= 21)
+    )
+    ax.plot(track_lon[mask], track_lat[mask],
+            color="blue", linewidth=2, linestyle="--", zorder=6)
+    if mask.sum() >= 2:
+        x_end  = track_lon[mask][-1]
+        y_end  = track_lat[mask][-1]
+        x_prev = track_lon[mask][-2]
+        y_prev = track_lat[mask][-2]
+        ax.annotate(
+            '',
+            xy=(x_end, y_end),
+            xytext=(x_prev, y_prev),
+            arrowprops=dict(arrowstyle='->', color='blue', lw=2),
+            zorder=7
+        )
+
+    def _plot_colored_lines(gdf_imp, zorder, linewidth=0.6):
+        if len(gdf_imp) == 0:
+            return
+        for color, group in gdf_imp.groupby("color_hex"):
+            gpd.GeoDataFrame(group, geometry=group.geometry, crs=gdf_imp.crs).plot(
+                ax=ax, color=str(color), linewidth=linewidth, zorder=zorder
+            )
+
+    def _plot_colored_points(gdf_imp, zorder, markersize=3, marker="o"):
+        if len(gdf_imp) == 0:
+            return
+        for color, group in gdf_imp.groupby("color_hex"):
+            gpd.GeoDataFrame(group, geometry=group.geometry, crs=gdf_imp.crs).plot(
+                ax=ax, color=str(color), markersize=markersize,
+                marker=marker, zorder=zorder
+            )
+
+    _plot_colored_lines(road_impact,      zorder=2, linewidth=0.4)
+    _plot_colored_lines(power_impact,     zorder=3, linewidth=0.7)
+    _plot_colored_points(hospital_impact, zorder=5, markersize=1, marker="^")
+    _plot_colored_points(school_impact,   zorder=4, markersize=1, marker="o")
+
+    type_handles = [
+        mlines.Line2D([], [], color="blue", linestyle="--", linewidth=2,
+                      label="台风路径"),
+        mlines.Line2D([], [], color=TYPE_COLOR["road"],
+                      linewidth=1.5, label=f"道路（共{len(road_impact)}）"),
+        mlines.Line2D([], [], color=TYPE_COLOR["power"],
+                      linewidth=1.5, label=f"电力（共{len(power_impact)}）"),
+        mlines.Line2D([], [], color=TYPE_COLOR["hospital"],
+                      marker="^", linestyle="None", markersize=6,
+                      label=f"医院（共{len(hospital_impact)}）"),
+        mlines.Line2D([], [], color=TYPE_COLOR["school"],
+                      marker="o", linestyle="None", markersize=6,
+                      label=f"学校（共{len(school_impact)}）"),
+    ]
+    risk_labels = [
+        "风险1 (0–0.2)", "风险2 (0.2–0.4)", "风险3 (0.4–0.6)",
+        "风险4 (0.6–0.8)", "风险5 (0.8–1.0)"
+    ]
+    risk_handles = [
+        mpatches.Patch(color=RED_LEVELS[i], label=risk_labels[i])
+        for i in range(5)
+    ]
+    ax.legend(
+        handles=type_handles + risk_handles,
+        loc="upper left", bbox_to_anchor=(1.0, 1.0),
+        fontsize=8, framealpha=0.85
+    )
+
+    # [重构6] 标题包含情景名称
+    ax.set_title(
+        f"CMIP6 {scenario_name} 未来气候情景下基础设施受损分布\n",
+        fontsize=11, pad=5
+    )
+    ax.set_xlabel("经度")
+    ax.set_ylabel("纬度")
+    ax.set_xlim(108, 112)
+    ax.set_ylim(17, 21)
+    ax.set_aspect('equal')
+
+    # [重构6] 文件名包含情景名称（小写）
+    scenario_lower = scenario_name.lower()
+    out_png = f"hainan_infra_impact_{scenario_lower}.png"
+    plt.savefig(out_png, dpi=150, bbox_inches="tight", pad_inches=0.3)
+    print(f"\n图像已保存至 {out_png}")
+    plt.show()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 十二、程序入口
+# [重构5] 双情景循环：SSP245 → SSP585，收集 summary，输出对比 CSV
+
+if __name__ == "__main__":
+
+    # ── [重构1] 两个情景配置 ─────────────────────────────────────────────────
+
+    cfg_245 = ScenarioConfig(
+        name="SSP245",
+        gcm="ACCESS-CM2",
+        ensemble="r1i1p1f1",
+        baseline_period=(1981, 2010),
+        future_period=(2031, 2060),
+        region_bounds=(108.5, 18.0, 111.5, 20.5),
+    )
+
+    cfg_585 = ScenarioConfig(
+        name="SSP585",
+        gcm="ACCESS-CM2",
+        ensemble="r1i1p1f1",
+        baseline_period=(1981, 2010),
+        future_period=(2031, 2060),
+        region_bounds=(108.5, 18.0, 111.5, 20.5),
+    )
+
+    # ── [重构5] 双情景循环 ────────────────────────────────────────────────────
+    results = []
+
+    for cfg in [cfg_245, cfg_585]:
+
+        print(f"\n{'—'*60}")
+        print(f"# 开始处理情景：{cfg.name}")
+        print(f"{'—'*60}")
+
+        # 构建未来 Hazard（含轨迹生成）
+        haz, tracks = build_future_hazard(cfg)
+        print(f"\nHazard 加载完毕：{haz.size} 事件，{haz.centroids.size} 质心")
+        print(f"轨迹数量: {tracks.size}")
+
+        # 基础设施损伤分析
+        hospital_impact, school_impact, power_impact, road_impact = \
+            analyze_infrastructure_impact(haz, tracks, scenario_name=cfg.name, event_id=5)
+
+        # 汇总统计
+        summary = {
+            "scenario":           cfg.name,
+            "hospital_count":     len(hospital_impact),
+            "school_count":       len(school_impact),
+            "power_count":        len(power_impact),
+            "road_count":         len(road_impact),
+            "hospital_mean_damage": (
+                hospital_impact["damage_prob"].mean()
+                if len(hospital_impact) > 0 else 0
+            ),
+            "school_mean_damage": (
+                school_impact["damage_prob"].mean()
+                if len(school_impact) > 0 else 0
+            ),
+            "power_mean_damage": (
+                power_impact["damage_prob"].mean()
+                if len(power_impact) > 0 else 0
+            ),
+            "road_mean_damage": (
+                road_impact["damage_prob"].mean()
+                if len(road_impact) > 0 else 0
+            ),
+        }
+        results.append(summary)
+
+        # [重构5] 各情景单独 CSV 输出（ssp245_results.csv / ssp585_results.csv）
+        scenario_lower = cfg.name.lower()
+        df_single = pd.DataFrame([summary])
+        single_csv_path = DATA_DIR / f"{scenario_lower}_results.csv"
+        df_single.to_csv(single_csv_path, index=False, encoding="utf-8-sig")
+        print(f"\n  [{cfg.name}] 单情景汇总已保存: {single_csv_path}")
+
+    # ── [重构5] 双情景对比汇总输出 ───────────────────────────────────────────
+    df_compare = pd.DataFrame(results)
+
+    print(f"\n{'='*60}")
+    print(" SSP245 vs SSP585 双情景对比汇总")
+    print(f"{'='*60}")
+    print(df_compare.to_string(index=False))
+
+    compare_csv_path = DATA_DIR / "scenario_compare.csv"
+    df_compare.to_csv(compare_csv_path, index=False, encoding="utf-8-sig")
+    print(f"\n对比结果已保存: {compare_csv_path}")
+
+    # ── 差异分析打印 ──────────────────────────────────────────────────────────
+    if len(df_compare) == 2:
+        row_245 = df_compare[df_compare["scenario"] == "SSP245"].iloc[0]
+        row_585 = df_compare[df_compare["scenario"] == "SSP585"].iloc[0]
+
+        print(f"\n{'='*60}")
+        print(" SSP585 相对 SSP245 变化量（Δ = SSP585 − SSP245）")
+        print(f"{'='*60}")
+        for col in ["hospital_count", "school_count", "power_count", "road_count",
+                    "hospital_mean_damage", "school_mean_damage",
+                    "power_mean_damage",    "road_mean_damage"]:
+            delta = row_585[col] - row_245[col]
+            print(f"  Δ {col:30s}: {delta:+.4f}")
