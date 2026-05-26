@@ -1,0 +1,502 @@
+#问题 2 用的是“响应面模型/随机森林 + 网格搜索 + Pareto 前沿 + 简化 TOPSIS”；问题 3 用的是“利润函数 + 价格和电价情景分析 + 可行方案枚举择优”
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import KFold, cross_val_score
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.ensemble import RandomForestRegressor
+
+
+BASE_DIR = Path("E:/\u684c\u9762\u6587\u4ef6/\u6570\u6a21")
+DATA_FILE = BASE_DIR / "\u9644\u4ef61\uff1a\u78c1\u9009\u67f1\u5206\u9009\u8bd5\u9a8c\u6570\u636e.xlsx"
+OUT_DIR = BASE_DIR / "outputs_q2_q3"
+
+POWER_I = 1.5
+POWER_W = 0.08
+ELECTRICITY_PRICE = 0.75
+FEED_TON_PER_HOUR = 100
+
+
+def setup_plot_style():
+    sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
+    plt.rcParams["axes.unicode_minus"] = False
+    plt.rcParams["font.sans-serif"] = [
+        "Microsoft YaHei",
+        "SimHei",
+        "Arial Unicode MS",
+        "DejaVu Sans",
+    ]
+
+
+def load_data():
+    df = pd.read_excel(DATA_FILE)
+    df.columns = ["seq", "I", "W", "beta", "theta", "gamma", "eps"]
+    return df
+
+
+def add_energy(df):
+    df = df.copy()
+    df["power_kw"] = POWER_I * df["I"] + POWER_W * df["W"]
+    df["energy_cost_yuan_h"] = df["power_kw"] * ELECTRICITY_PRICE
+    return df
+
+
+def fit_response_surface(train_df):
+    x = train_df[["I", "W"]].to_numpy()
+    poly = PolynomialFeatures(degree=2, include_bias=True)
+    x_poly = poly.fit_transform(x)
+    models = {}
+    metrics = []
+    for target in ["beta", "theta", "gamma", "eps"]:
+        model = LinearRegression()
+        model.fit(x_poly, train_df[target].to_numpy())
+        pred = model.predict(x_poly)
+        models[target] = model
+        rmse = rmse_score(train_df[target], pred)
+        mae = mean_absolute_error(train_df[target], pred)
+        n = len(train_df)
+        p = x_poly.shape[1] - 1
+        r2 = r2_score(train_df[target], pred)
+        adj_r2 = 1 - (1 - r2) * (n - 1) / (n - p - 1)
+        metrics.append(
+            {
+                "target": target,
+                "r2": r2,
+                "adj_r2": adj_r2,
+                "rmse": rmse,
+                "mae": mae,
+                "formula": format_formula(model, poly, target),
+            }
+        )
+    return poly, models, pd.DataFrame(metrics)
+
+
+def fit_random_forest(train_df):
+    x = train_df[["I", "W"]].to_numpy()
+    models = {}
+    metrics = []
+    cv = KFold(n_splits=5, shuffle=True, random_state=42)
+    for target in ["beta", "theta", "gamma", "eps"]:
+        model = RandomForestRegressor(
+            n_estimators=500,
+            min_samples_leaf=2,
+            random_state=42,
+        )
+        y = train_df[target].to_numpy()
+        model.fit(x, y)
+        pred = model.predict(x)
+        cv_scores = cross_val_score(model, x, y, cv=cv, scoring="r2")
+        models[target] = model
+        metrics.append(
+            {
+                "target": target,
+                "train_r2": r2_score(y, pred),
+                "cv_r2_mean": cv_scores.mean(),
+                "cv_r2_std": cv_scores.std(),
+                "importance_I": model.feature_importances_[0],
+                "importance_W": model.feature_importances_[1],
+            }
+        )
+    return models, pd.DataFrame(metrics)
+
+
+def format_formula(model, poly, target):
+    names = poly.get_feature_names_out(["I", "W"])
+    parts = []
+    for coef, name in zip(model.coef_, names):
+        if name == "1":
+            continue
+        parts.append(f"{coef:+.6f}*{name}")
+    return f"{target} = {model.intercept_:.6f} " + " ".join(parts)
+
+
+def predict(models, poly, grid_df):
+    x_poly = poly.transform(grid_df[["I", "W"]].to_numpy())
+    out = grid_df.copy()
+    for target, model in models.items():
+        out[target] = model.predict(x_poly)
+    out = add_energy(out)
+    return out
+
+
+def predict_rf(models, grid_df):
+    x = grid_df[["I", "W"]].to_numpy()
+    out = grid_df.copy()
+    for target, model in models.items():
+        out[target] = model.predict(x)
+    out["beta"] = out["beta"].clip(0, 100)
+    out["theta"] = out["theta"].clip(0, 100)
+    out["gamma"] = out["gamma"].clip(0, 100)
+    out["eps"] = out["eps"].clip(0, 100)
+    out = add_energy(out)
+    return out
+
+
+def pareto_front(feasible_df):
+    df = feasible_df.sort_values(["power_kw", "gamma"], ascending=[True, False]).copy()
+    keep = []
+    best_gamma = -np.inf
+    for idx, row in df.iterrows():
+        if row["gamma"] > best_gamma + 1e-9:
+            keep.append(idx)
+            best_gamma = row["gamma"]
+    return df.loc[keep].sort_values("power_kw").reset_index(drop=True)
+
+
+def topsis_select(pareto_df, w_gamma=0.5, w_energy=0.5):
+    df = pareto_df.copy()
+    gamma_span = df["gamma"].max() - df["gamma"].min()
+    energy_span = df["power_kw"].max() - df["power_kw"].min()
+    gamma_norm = pd.Series(1.0, index=df.index) if gamma_span == 0 else (
+        df["gamma"] - df["gamma"].min()
+    ) / gamma_span
+    energy_norm = pd.Series(1.0, index=df.index) if energy_span == 0 else (
+        df["power_kw"].max() - df["power_kw"]
+    ) / energy_span
+    df["score"] = w_gamma * gamma_norm + w_energy * energy_norm
+    return df.loc[df["score"].idxmax()], df
+
+
+def price_by_grade(beta):
+    beta = np.asarray(beta)
+    return np.where(beta >= 64, 800 + (beta - 64) * 15, 800 + (beta - 64) * 20)
+
+
+def profit_per_hour(df, price_factor=1.0, electricity_factor=1.0):
+    price = price_by_grade(df["beta"]) * price_factor
+    concentrate_ton = FEED_TON_PER_HOUR * df["gamma"] / 100
+    energy_cost = df["power_kw"] * ELECTRICITY_PRICE * electricity_factor
+    return concentrate_ton * price - energy_cost
+
+
+def make_grid():
+    i_values = np.linspace(1.2, 2.0, 401)
+    w_values = np.linspace(14.0, 23.0, 901)
+    ii, ww = np.meshgrid(i_values, w_values)
+    return pd.DataFrame({"I": ii.ravel(), "W": ww.ravel()})
+
+
+def plot_pareto(feasible, pareto, selected):
+    plt.figure(figsize=(8, 5.5))
+    plt.scatter(feasible["power_kw"], feasible["gamma"], s=8, alpha=0.25, label="Feasible grid")
+    plt.plot(pareto["power_kw"], pareto["gamma"], color="#d62728", lw=2.4, label="Pareto front")
+    plt.scatter(
+        selected["power_kw"],
+        selected["gamma"],
+        s=95,
+        color="#111111",
+        marker="*",
+        label="TOPSIS choice",
+        zorder=5,
+    )
+    plt.xlabel("Energy power / kW")
+    plt.ylabel("Concentrate yield gamma / %")
+    plt.title("Problem 2 Pareto Front: Yield vs. Energy")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "q2_pareto_front.png", dpi=300)
+    plt.close()
+
+
+def plot_feasible_map(grid, selected):
+    pivot = grid.pivot_table(index="W", columns="I", values="gamma")
+    plt.figure(figsize=(8, 5.8))
+    ax = sns.heatmap(
+        pivot,
+        cmap="viridis",
+        cbar_kws={"label": "Predicted gamma / %"},
+        xticklabels=80,
+        yticklabels=90,
+    )
+    ax.invert_yaxis()
+    plt.title("Predicted Yield Surface on I-W Grid")
+    plt.xlabel("Excitation current I / A")
+    plt.ylabel("Upward water flow W / mL/s")
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "q2_yield_surface_heatmap.png", dpi=300)
+    plt.close()
+
+    plt.figure(figsize=(8, 5.8))
+    feasible = (grid["beta"] >= 67) & (grid["eps"] >= 95)
+    plt.scatter(grid.loc[~feasible, "I"], grid.loc[~feasible, "W"], s=1, alpha=0.05, color="#cccccc")
+    plt.scatter(grid.loc[feasible, "I"], grid.loc[feasible, "W"], s=1, alpha=0.25, color="#2ca02c")
+    plt.scatter(selected["I"], selected["W"], s=100, color="#d62728", marker="*", label="TOPSIS choice")
+    plt.xlabel("Excitation current I / A")
+    plt.ylabel("Upward water flow W / mL/s")
+    plt.title("Feasible Region under beta >= 67% and eps >= 95%")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "q2_feasible_region.png", dpi=300)
+    plt.close()
+
+
+def plot_sensitivity(sens_df):
+    plt.figure(figsize=(8, 5.5))
+    sns.lineplot(data=sens_df, x="beta_min", y="gamma", hue="eps_min", marker="o")
+    plt.xlabel("Minimum concentrate grade beta / %")
+    plt.ylabel("Optimal predicted gamma / %")
+    plt.title("Sensitivity to Quality Constraints")
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "q2_constraint_sensitivity.png", dpi=300)
+    plt.close()
+
+
+def rmse_score(y_true, y_pred):
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+def plot_profit_sensitivity(econ_df, prefix="q3"):
+    pivot = econ_df.pivot(index="electricity_factor", columns="price_factor", values="profit_yuan_h")
+    plt.figure(figsize=(8, 5.8))
+    sns.heatmap(pivot, cmap="RdYlGn", annot=True, fmt=".0f", cbar_kws={"label": "Profit / yuan per hour"})
+    plt.xlabel("Market price factor")
+    plt.ylabel("Electricity price factor")
+    plt.title("Problem 3 Dynamic Profit Sensitivity")
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / f"{prefix}_profit_sensitivity_heatmap.png", dpi=300)
+    plt.close()
+
+    plt.figure(figsize=(8, 5.5))
+    sns.lineplot(data=econ_df, x="price_factor", y="opt_I", hue="electricity_factor", marker="o")
+    plt.xlabel("Market price factor")
+    plt.ylabel("Optimal I / A")
+    plt.title("Price and Energy Cost Effects on Optimal Current")
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / f"{prefix}_optimal_I_under_scenarios.png", dpi=300)
+    plt.close()
+
+
+def plot_model_diagnostics(train_df, poly, rsm_models, rf_models):
+    targets = ["beta", "theta", "gamma", "eps"]
+    labels = {
+        "beta": "Concentrate grade beta / %",
+        "theta": "Tailings grade theta / %",
+        "gamma": "Concentrate yield gamma / %",
+        "eps": "Iron recovery eps / %",
+    }
+    x = train_df[["I", "W"]].to_numpy()
+    x_poly = poly.transform(x)
+
+    rows = []
+    fig, axes = plt.subplots(2, 4, figsize=(15, 7))
+    for j, target in enumerate(targets):
+        y = train_df[target].to_numpy()
+        pred_rsm = rsm_models[target].predict(x_poly)
+        pred_rf = rf_models[target].predict(x)
+        rows.extend(
+            [
+                {
+                    "target": target,
+                    "model": "RSM",
+                    "r2": r2_score(y, pred_rsm),
+                    "rmse": rmse_score(y, pred_rsm),
+                    "mae": mean_absolute_error(y, pred_rsm),
+                },
+                {
+                    "target": target,
+                    "model": "RF",
+                    "r2": r2_score(y, pred_rf),
+                    "rmse": rmse_score(y, pred_rf),
+                    "mae": mean_absolute_error(y, pred_rf),
+                },
+            ]
+        )
+
+        ax = axes[0, j]
+        ax.scatter(y, pred_rsm, s=28, label="RSM", alpha=0.75)
+        ax.scatter(y, pred_rf, s=28, label="RF", alpha=0.75)
+        lo = min(y.min(), pred_rsm.min(), pred_rf.min())
+        hi = max(y.max(), pred_rsm.max(), pred_rf.max())
+        ax.plot([lo, hi], [lo, hi], color="#222222", lw=1)
+        ax.set_title(target)
+        ax.set_xlabel("Observed")
+        ax.set_ylabel("Predicted")
+        if j == 0:
+            ax.legend()
+
+        ax = axes[1, j]
+        ax.axhline(0, color="#222222", lw=1)
+        ax.scatter(pred_rsm, y - pred_rsm, s=28, label="RSM", alpha=0.75)
+        ax.scatter(pred_rf, y - pred_rf, s=28, label="RF", alpha=0.75)
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Residual")
+        ax.set_title(labels[target])
+
+    fig.suptitle("Model Diagnostics: Observed-Predicted and Residual Plots", y=1.02)
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "model_diagnostics_rsm_rf.png", dpi=300, bbox_inches="tight")
+    plt.close()
+
+    comp = pd.DataFrame(rows)
+    plt.figure(figsize=(8, 5.2))
+    sns.barplot(data=comp, x="target", y="rmse", hue="model")
+    plt.xlabel("Response variable")
+    plt.ylabel("RMSE")
+    plt.title("Prediction Error Comparison between RSM and Random Forest")
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "model_rmse_comparison.png", dpi=300)
+    plt.close()
+    comp.to_csv(OUT_DIR / "model_comparison_metrics.csv", index=False, encoding="utf-8-sig")
+    return comp
+
+
+def plot_rf_importance(rf_metrics):
+    imp = rf_metrics.melt(
+        id_vars="target",
+        value_vars=["importance_I", "importance_W"],
+        var_name="variable",
+        value_name="importance",
+    )
+    imp["variable"] = imp["variable"].map({"importance_I": "I", "importance_W": "W"})
+    plt.figure(figsize=(8, 5.2))
+    sns.barplot(data=imp, x="target", y="importance", hue="variable")
+    plt.xlabel("Response variable")
+    plt.ylabel("Random forest feature importance")
+    plt.title("Sensitivity Clue from Random Forest Feature Importance")
+    plt.tight_layout()
+    plt.savefig(OUT_DIR / "rf_feature_importance.png", dpi=300)
+    plt.close()
+
+
+def summarize_optimization(grid, prefix):
+    feasible = grid[(grid["beta"] >= 67) & (grid["eps"] >= 95)].copy()
+    pareto = pareto_front(feasible)
+    selected, pareto_scored = topsis_select(pareto)
+    pareto_scored.to_csv(OUT_DIR / f"{prefix}_q2_pareto_scored.csv", index=False, encoding="utf-8-sig")
+
+    econ_rows = []
+    for price_factor in np.round(np.linspace(0.85, 1.15, 7), 2):
+        for electricity_factor in [0.8, 1.0, 1.2]:
+            tmp = feasible.copy()
+            tmp["profit_yuan_h"] = profit_per_hour(tmp, price_factor, electricity_factor)
+            best = tmp.loc[tmp["profit_yuan_h"].idxmax()]
+            econ_rows.append(
+                {
+                    "price_factor": price_factor,
+                    "electricity_factor": electricity_factor,
+                    "opt_I": best["I"],
+                    "opt_W": best["W"],
+                    "beta": best["beta"],
+                    "gamma": best["gamma"],
+                    "eps": best["eps"],
+                    "power_kw": best["power_kw"],
+                    "profit_yuan_h": best["profit_yuan_h"],
+                }
+            )
+    econ_df = pd.DataFrame(econ_rows)
+    econ_df.to_csv(OUT_DIR / f"{prefix}_q3_economic_scenarios.csv", index=False, encoding="utf-8-sig")
+    return feasible, pareto_scored, selected, econ_df
+
+
+def main():
+    setup_plot_style()
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    raw = load_data()
+    clean = raw[~raw["seq"].isin([15, 29, 30])].copy()
+    raw = add_energy(raw)
+    clean = add_energy(clean)
+
+    poly, models, metrics = fit_response_surface(clean)
+    rf_models, rf_metrics = fit_random_forest(clean)
+    grid = predict(models, poly, make_grid())
+    rf_grid = predict_rf(rf_models, make_grid())
+    feasible = grid[(grid["beta"] >= 67) & (grid["eps"] >= 95)].copy()
+    pareto = pareto_front(feasible)
+    selected, pareto_scored = topsis_select(pareto)
+
+    sens_rows = []
+    for beta_min in [66.5, 67.0, 67.5, 68.0]:
+        for eps_min in [94.5, 95.0, 95.5, 96.0]:
+            tmp = grid[(grid["beta"] >= beta_min) & (grid["eps"] >= eps_min)].copy()
+            if tmp.empty:
+                sens_rows.append({"beta_min": beta_min, "eps_min": eps_min})
+                continue
+            p = pareto_front(tmp)
+            choice, _ = topsis_select(p)
+            sens_rows.append(
+                {
+                    "beta_min": beta_min,
+                    "eps_min": eps_min,
+                    "I": choice["I"],
+                    "W": choice["W"],
+                    "gamma": choice["gamma"],
+                    "power_kw": choice["power_kw"],
+                    "beta": choice["beta"],
+                    "eps": choice["eps"],
+                }
+            )
+    sens_df = pd.DataFrame(sens_rows)
+
+    econ_rows = []
+    scenario_grid = feasible.copy()
+    for price_factor in np.round(np.linspace(0.85, 1.15, 7), 2):
+        for electricity_factor in [0.8, 1.0, 1.2]:
+            tmp = scenario_grid.copy()
+            tmp["profit_yuan_h"] = profit_per_hour(tmp, price_factor, electricity_factor)
+            best = tmp.loc[tmp["profit_yuan_h"].idxmax()]
+            econ_rows.append(
+                {
+                    "price_factor": price_factor,
+                    "electricity_factor": electricity_factor,
+                    "opt_I": best["I"],
+                    "opt_W": best["W"],
+                    "beta": best["beta"],
+                    "gamma": best["gamma"],
+                    "eps": best["eps"],
+                    "power_kw": best["power_kw"],
+                    "profit_yuan_h": best["profit_yuan_h"],
+                }
+            )
+    econ_df = pd.DataFrame(econ_rows)
+    rf_feasible, rf_pareto, rf_selected, rf_econ_df = summarize_optimization(rf_grid, "rf")
+
+    raw.to_csv(OUT_DIR / "raw_with_energy.csv", index=False, encoding="utf-8-sig")
+    clean.to_csv(OUT_DIR / "clean_data.csv", index=False, encoding="utf-8-sig")
+    metrics.to_csv(OUT_DIR / "response_surface_metrics.csv", index=False, encoding="utf-8-sig")
+    rf_metrics.to_csv(OUT_DIR / "random_forest_metrics.csv", index=False, encoding="utf-8-sig")
+    grid.to_csv(OUT_DIR / "prediction_grid.csv", index=False, encoding="utf-8-sig")
+    pareto_scored.to_csv(OUT_DIR / "q2_pareto_scored.csv", index=False, encoding="utf-8-sig")
+    sens_df.to_csv(OUT_DIR / "q2_sensitivity.csv", index=False, encoding="utf-8-sig")
+    econ_df.to_csv(OUT_DIR / "q3_economic_scenarios.csv", index=False, encoding="utf-8-sig")
+
+    plot_pareto(feasible, pareto_scored, selected)
+    plot_feasible_map(grid, selected)
+    plot_sensitivity(sens_df.dropna())
+    plot_profit_sensitivity(econ_df, "q3")
+    model_comp = plot_model_diagnostics(clean, poly, models, rf_models)
+    plot_rf_importance(rf_metrics)
+    plot_pareto(rf_feasible, rf_pareto, rf_selected)
+    (OUT_DIR / "q2_pareto_front.png").replace(OUT_DIR / "rf_q2_pareto_front.png")
+    plot_profit_sensitivity(rf_econ_df, "rf_q3")
+    plot_pareto(feasible, pareto_scored, selected)
+    plot_profit_sensitivity(econ_df, "q3")
+
+    print("Output directory:", OUT_DIR)
+    print("\nResponse surface metrics")
+    print(metrics[["target", "r2", "formula"]].to_string(index=False))
+    print("\nProblem 2 TOPSIS selected solution")
+    print(selected[["I", "W", "beta", "gamma", "eps", "power_kw", "energy_cost_yuan_h", "score"]])
+    print("\nProblem 3 baseline economic optimum")
+    baseline = econ_df[(econ_df["price_factor"] == 1.0) & (econ_df["electricity_factor"] == 1.0)]
+    print(baseline.to_string(index=False))
+    print("\nRandom forest metrics")
+    print(rf_metrics.to_string(index=False))
+    print("\nModel comparison metrics")
+    print(model_comp.to_string(index=False))
+    print("\nRandom forest Problem 2 TOPSIS selected solution")
+    print(rf_selected[["I", "W", "beta", "gamma", "eps", "power_kw", "energy_cost_yuan_h", "score"]])
+    print("\nRandom forest Problem 3 baseline economic optimum")
+    rf_baseline = rf_econ_df[
+        (rf_econ_df["price_factor"] == 1.0) & (rf_econ_df["electricity_factor"] == 1.0)
+    ]
+    print(rf_baseline.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
