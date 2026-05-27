@@ -1,0 +1,222 @@
+"""
+恢复优化模块：复刻文献公式（9）和灾前/灾后优化算法
+
+双击运行会执行一个最小示例，真实数据接入时把 objective 换成你的城市网络评估函数。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Sequence
+
+import numpy as np
+
+
+@dataclass
+class Timeline:
+    time: np.ndarray
+    function_percent: np.ndarray
+
+    def area_loss(self, start: float | None = None, end: float | None = None) -> float:
+        time = self.time.astype(float)
+        values = self.function_percent.astype(float)
+        if start is not None or end is not None:
+            lo = time[0] if start is None else start
+            hi = time[-1] if end is None else end
+            mask = (time >= lo) & (time <= hi)
+            time = time[mask]
+            values = values[mask]
+        if len(time) < 2:
+            return 0.0
+        return float(np.trapz(100.0 - values, time))
+
+
+@dataclass
+class OptimizationResult:
+    best_solution: np.ndarray | list[str]
+    best_score: float
+    iterations: int
+
+
+def resilience_metric(
+    loss_timeline: Timeline,
+    recovery_timeline: Timeline,
+    typhoon_end_time: float,
+    repair_start_time: float,
+) -> float:
+    """公式（9）：韧性指标，越小表示韧性越好。"""
+
+    loss_area = loss_timeline.area_loss(loss_timeline.time[0], typhoon_end_time)
+    residual = float(np.interp(typhoon_end_time, loss_timeline.time, loss_timeline.function_percent))
+    waiting_area = max(repair_start_time - typhoon_end_time, 0.0) * (100.0 - residual)
+    recovery_area = recovery_timeline.area_loss(repair_start_time, recovery_timeline.time[-1])
+    return loss_area + waiting_area + recovery_area
+
+
+def build_loss_timeline(times: Sequence[float], functions: Sequence[float]) -> Timeline:
+    return Timeline(np.asarray(times, dtype=float), 100.0 * np.asarray(functions, dtype=float))
+
+
+def build_recovery_timeline(start_time: float, step_durations: Sequence[float], functions: Sequence[float]) -> Timeline:
+    times = [float(start_time)]
+    values = [100.0 * float(functions[0])]
+    current = float(start_time)
+    for duration, function in zip(step_durations, functions[1:]):
+        current += float(duration)
+        times.extend([current, current])
+        values.extend([values[-1], 100.0 * float(function)])
+    return Timeline(np.asarray(times), np.asarray(values))
+
+
+def particle_swarm_optimize(
+    objective: Callable[[np.ndarray], float],
+    dimensions: int,
+    bounds: Sequence[tuple[float, float]],
+    particles: int = 30,
+    inertia: float = 0.7,
+    cognitive: float = 1.5,
+    social: float = 1.5,
+    max_iter: int = 500,
+    stall_iter: int = 100,
+    seed: int | None = None,
+) -> OptimizationResult:
+    """灾前策略优化：粒子群算法，对应文献公式（11）-（13）。"""
+
+    rng = np.random.default_rng(seed)
+    lower = np.array([item[0] for item in bounds], dtype=float)
+    upper = np.array([item[1] for item in bounds], dtype=float)
+    span = upper - lower
+    position = lower + rng.random((particles, dimensions)) * span
+    velocity = rng.normal(0.0, 0.1, size=(particles, dimensions)) * span
+
+    personal_best = position.copy()
+    personal_score = np.array([objective(x) for x in position])
+    best_idx = int(np.argmin(personal_score))
+    global_best = personal_best[best_idx].copy()
+    global_score = float(personal_score[best_idx])
+    stalled = 0
+
+    for iteration in range(1, max_iter + 1):
+        r1 = rng.random((particles, dimensions))
+        r2 = rng.random((particles, dimensions))
+        velocity = (
+            inertia * velocity
+            + cognitive * r1 * (personal_best - position)
+            + social * r2 * (global_best - position)
+        )
+        position = np.clip(position + velocity, lower, upper)
+        scores = np.array([objective(x) for x in position])
+        improved = scores < personal_score
+        personal_best[improved] = position[improved]
+        personal_score[improved] = scores[improved]
+        best_idx = int(np.argmin(personal_score))
+        if personal_score[best_idx] < global_score:
+            global_best = personal_best[best_idx].copy()
+            global_score = float(personal_score[best_idx])
+            stalled = 0
+        else:
+            stalled += 1
+        if stalled >= stall_iter:
+            break
+    return OptimizationResult(global_best, global_score, iteration)
+
+
+def genetic_recovery_path_optimize(
+    objective: Callable[[list[str]], float],
+    damaged_components: Sequence[str],
+    population_size: int = 80,
+    max_generations: int = 500,
+    mutation_rate: float = 0.15,
+    elite_size: int = 4,
+    stall_generations: int = 100,
+    seed: int | None = None,
+) -> OptimizationResult:
+    """灾后抢修路径优化：遗传算法。"""
+
+    rng = np.random.default_rng(seed)
+    components = list(damaged_components)
+    population = [list(rng.permutation(components)) for _ in range(population_size)]
+    best_path = components.copy()
+    best_score = float("inf")
+    stalled = 0
+
+    for generation in range(1, max_generations + 1):
+        scores = np.array([objective(path) for path in population])
+        order = np.argsort(scores)
+        if scores[order[0]] < best_score:
+            best_score = float(scores[order[0]])
+            best_path = population[int(order[0])].copy()
+            stalled = 0
+        else:
+            stalled += 1
+        if stalled >= stall_generations:
+            break
+
+        next_population = [population[int(i)].copy() for i in order[:elite_size]]
+        while len(next_population) < population_size:
+            parent_a = tournament_select(population, scores, rng)
+            parent_b = tournament_select(population, scores, rng)
+            child = ordered_crossover(parent_a, parent_b, rng)
+            if rng.random() < mutation_rate:
+                swap_mutation(child, rng)
+            next_population.append(child)
+        population = next_population
+    return OptimizationResult(best_path, best_score, generation)
+
+
+def tournament_select(population: list[list[str]], scores: np.ndarray, rng: np.random.Generator) -> list[str]:
+    candidates = rng.choice(len(population), size=3, replace=False)
+    best = int(candidates[np.argmin(scores[candidates])])
+    return population[best].copy()
+
+
+def ordered_crossover(parent_a: list[str], parent_b: list[str], rng: np.random.Generator) -> list[str]:
+    size = len(parent_a)
+    start, end = sorted(rng.choice(size, size=2, replace=False))
+    child: list[str | None] = [None] * size
+    child[start : end + 1] = parent_a[start : end + 1]
+    fill = [gene for gene in parent_b if gene not in child]
+    idx = 0
+    for i in range(size):
+        if child[i] is None:
+            child[i] = fill[idx]
+            idx += 1
+    return [str(gene) for gene in child]
+
+
+def swap_mutation(path: list[str], rng: np.random.Generator) -> None:
+    i, j = rng.choice(len(path), size=2, replace=False)
+    path[int(i)], path[int(j)] = path[int(j)], path[int(i)]
+
+
+def main() -> None:
+    print("恢复优化模块正在运行：公式（9）+ PSO + 遗传算法最小示例")
+
+    loss = build_loss_timeline(times=[0, 3, 6, 9], functions=[1.0, 0.9, 0.65, 0.5])
+    recovery = build_recovery_timeline(start_time=12, step_durations=[1, 2], functions=[0.5, 0.8, 1.0])
+    r = resilience_metric(loss, recovery, typhoon_end_time=9, repair_start_time=12)
+    print(f"示例韧性指标 R = {r:.3f}，数值越小越好")
+
+    pso = particle_swarm_optimize(
+        objective=lambda x: float((x[0] - 2.0) ** 2),
+        dimensions=1,
+        bounds=[(-5.0, 5.0)],
+        particles=10,
+        max_iter=100,
+        seed=1,
+    )
+    print(f"PSO 示例最优解 = {pso.best_solution[0]:.3f}")
+
+    ga = genetic_recovery_path_optimize(
+        objective=lambda path: 0.0 if path[0] == "L2" else 1.0,
+        damaged_components=["L1", "L2", "L3"],
+        seed=42,
+    )
+    print(f"遗传算法示例最优抢修顺序 = {ga.best_solution}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        input("\n运行结束。按回车退出...")
