@@ -1,0 +1,1018 @@
+"""
+失效演化模块：复刻文献公式（1）-（8）
+
+双击运行会执行一个最小示例，真实数据接入时主要改 main() 里读取数据的部分。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from math import atan2, degrees, erf, exp, isfinite, radians, sin, sqrt
+from pathlib import Path
+import re
+
+import geopandas as gpd
+import networkx as nx
+import numpy as np
+import pandas as pd
+from pyproj import Geod
+
+
+EARTH_ROTATION_RAD_S = 7.292e-5
+OUTER_PRESSURE_HPA = 1013.0
+BATTS_K = 6.72
+GEOD = Geod(ellps="WGS84")
+RAW_DIR = Path("data/raw")
+OUTPUT_DIR = Path("outputs")
+SIMULATION_MODE = "expected"  # "expected" or "monte_carlo"
+MONTE_CARLO_SAMPLES = 1000
+RANDOM_SEED = 42
+
+
+@dataclass
+class FragilityState:
+    """基础设施损伤状态。
+
+    states 建议按“由重到轻”排列：
+    complete -> severe -> moderate，完好状态会自动补为 1.0。
+    """
+
+    name: str
+    median: float
+    beta: float
+    function_value: float
+
+
+# Table 1 in the paper gives log-median wind speeds. The values match km/h,
+# so they are converted to m/s here before Eq. (4) is evaluated.
+PLANT_SUBSTATION_FRAGILITY = [
+    FragilityState("complete", median=exp(5.523) / 3.6, beta=0.132, function_value=0.0),
+    FragilityState("severe", median=exp(5.204) / 3.6, beta=0.147, function_value=0.3),
+    FragilityState("moderate", median=exp(5.068) / 3.6, beta=0.136, function_value=0.6),
+]
+
+# Table 2 in the paper: directional tower-line fragility curves.
+# The table stores log-median wind speed in m/s.
+TOWER_DIRECTIONAL_FRAGILITY = {
+    0.0: (3.153, 0.053),
+    22.5: (3.261, 0.051),
+    45.0: (3.612, 0.052),
+    67.5: (3.665, 0.053),
+    90.0: (3.730, 0.062),
+}
+
+
+@dataclass
+class Node:
+    node_id: str
+    node_type: str
+    load: float = 0.0
+    generation: float = 0.0
+    function_state: float = 1.0
+
+
+@dataclass
+class Edge:
+    edge_id: str
+    from_id: str
+    to_id: str
+    length: float
+    function_state: float = 1.0
+    has_spare: bool = False
+
+
+@dataclass
+class Metrics:
+    kte: float
+    ktr: float
+    klc: float
+    k: float
+
+
+class PowerNetwork:
+    """电力网络无向加权图，对应文献公式（6）-（8）。"""
+
+    def __init__(self) -> None:
+        self.nodes: dict[str, Node] = {}
+        self.edges: dict[str, Edge] = {}
+
+    def add_node(self, node: Node) -> None:
+        self.nodes[node.node_id] = node
+
+    def add_edge(self, edge: Edge) -> None:
+        self.edges[edge.edge_id] = edge
+
+    def copy(self) -> "PowerNetwork":
+        copied = PowerNetwork()
+        copied.nodes = {key: Node(**vars(value)) for key, value in self.nodes.items()}
+        copied.edges = {key: Edge(**vars(value)) for key, value in self.edges.items()}
+        return copied
+
+    def graph(self) -> nx.Graph:
+        graph = nx.Graph()
+        for node in self.nodes.values():
+            if node.function_state > 0:
+                graph.add_node(node.node_id)
+        for edge in self.edges.values():
+            if (edge.function_state > 0 or edge.has_spare) and edge.from_id in graph and edge.to_id in graph:
+                effective_function = max(edge.function_state, 1e-6)
+                graph.add_edge(edge.from_id, edge.to_id, weight=max(edge.length / effective_function, 1e-9))
+        return graph
+
+    def functional_metrics(
+        self,
+        baseline: Metrics | None = None,
+        lambdas: tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3),
+    ) -> Metrics:
+        graph = self.graph()
+        node_ids = list(self.nodes)
+        n = len(node_ids)
+
+        # KTE：节点间最短路径倒数均值。
+        kte = 0.0
+        if n > 1:
+            total = 0.0
+            for source in node_ids:
+                lengths = nx.single_source_dijkstra_path_length(graph, source, weight="weight") if source in graph else {}
+                for target in node_ids:
+                    if source == target:
+                        continue
+                    distance = lengths.get(target, float("inf"))
+                    if isfinite(distance) and distance > 0:
+                        total += 1.0 / distance
+            kte = total / (n * (n - 1))
+
+        load_nodes = [node for node in self.nodes.values() if node.load > 0 or node.node_type in {"substation", "bus", "load"}]
+        plants = [node for node in self.nodes.values() if node.generation > 0 or node.node_type == "plant"]
+
+        # KTR：负荷节点能连到多少电源点。
+        reliabilities = []
+        for load_node in load_nodes:
+            connected = 0
+            for plant in plants:
+                if load_node.node_id in graph and plant.node_id in graph and nx.has_path(graph, plant.node_id, load_node.node_id):
+                    connected += 1
+            if plants:
+                reliabilities.append(connected / len(plants))
+        ktr = float(np.mean(reliabilities)) if reliabilities else 0.0
+
+        # KLC：仍可供电的负荷比例。
+        total_load = sum(max(node.load, 0.0) for node in load_nodes)
+        served_load = 0.0
+        for node in load_nodes:
+            has_supply = any(
+                plant.node_id in graph
+                and node.node_id in graph
+                and nx.has_path(graph, plant.node_id, node.node_id)
+                for plant in plants
+            )
+            if has_supply:
+                served_load += node.load * node.function_state
+        klc = served_load / total_load if total_load > 0 else 0.0
+
+        if baseline is None:
+            k = lambdas[0] * kte + lambdas[1] * ktr + lambdas[2] * klc
+        else:
+            k = (
+                lambdas[0] * safe_ratio(kte, baseline.kte)
+                + lambdas[1] * safe_ratio(ktr, baseline.ktr)
+                + lambdas[2] * safe_ratio(klc, baseline.klc)
+            )
+        return Metrics(kte=kte, ktr=ktr, klc=klc, k=k)
+
+    def summary(self) -> dict[str, float]:
+        return {
+            "nodes": len(self.nodes),
+            "edges": len(self.edges),
+            "plants": sum(node.node_type == "plant" for node in self.nodes.values()),
+            "substations": sum(node.node_type == "substation" for node in self.nodes.values()),
+            "total_generation_mw": sum(node.generation for node in self.nodes.values()),
+            "total_load_proxy": sum(node.load for node in self.nodes.values()),
+        }
+
+
+def safe_ratio(value: float, baseline: float) -> float:
+    return value / baseline if abs(baseline) > 1e-12 else 0.0
+
+
+def radius_max_wind_m(center_pressure_hpa: float, outer_pressure_hpa: float = OUTER_PRESSURE_HPA) -> float:
+    """公式（2）：最大风半径。"""
+
+    pressure_diff = max(outer_pressure_hpa - center_pressure_hpa, 0.0)
+    return exp(-0.1239 * (sqrt(pressure_diff) ** 0.6003) + 5.1034) * 1000.0
+
+
+def max_wind_speed_ms(
+    center_pressure_hpa: float,
+    latitude_deg: float,
+    movement_speed_ms: float,
+    outer_pressure_hpa: float = OUTER_PRESSURE_HPA,
+) -> float:
+    """公式（3）：最大风速。"""
+
+    r_max = radius_max_wind_m(center_pressure_hpa, outer_pressure_hpa)
+    pressure_diff = max(outer_pressure_hpa - center_pressure_hpa, 0.0)
+    coriolis = r_max * EARTH_ROTATION_RAD_S * sin(radians(latitude_deg))
+    vmax = 0.865 * (BATTS_K * sqrt(pressure_diff) - coriolis) + 0.5 * movement_speed_ms
+    return max(vmax, 0.0)
+
+
+def wind_speed_at_height_ms(
+    distance_to_center_m: float,
+    height_m: float,
+    center_pressure_hpa: float,
+    latitude_deg: float,
+    movement_speed_ms: float,
+    max_wind_ms: float | None = None,
+    gradient_height_m: float = 500.0,
+    roughness_index: float = 0.18,
+) -> float:
+    """公式（1）：高度 h、距台风中心 r 处的风速。"""
+
+    r = max(distance_to_center_m, 1.0)
+    r_max = radius_max_wind_m(center_pressure_hpa)
+    if max_wind_ms is None or pd.isna(max_wind_ms) or max_wind_ms <= 0:
+        vmax = max_wind_speed_ms(center_pressure_hpa, latitude_deg, movement_speed_ms)
+    else:
+        vmax = max_wind_ms
+    vertical_factor = (height_m / gradient_height_m) ** roughness_index
+    radial_factor = r / r_max if r <= r_max else (r_max / r) ** 0.7
+    return vmax * radial_factor * vertical_factor
+
+
+def fragility_probability(intensity: float, median: float, beta: float) -> float:
+    """公式（4）：对数正态脆弱性曲线。"""
+
+    x = max(float(intensity), 1e-12)
+    z = np.log(x / median) / beta
+    return 0.5 * (1.0 + erf(z / sqrt(2.0)))
+
+
+def fragility_probability_log_median(intensity: float, log_median: float, beta: float) -> float:
+    """Eq. (4) when the paper table stores μ as ln(median wind speed)."""
+
+    x = max(float(intensity), 1e-12)
+    z = (np.log(x) - log_median) / beta
+    return 0.5 * (1.0 + erf(z / sqrt(2.0)))
+
+
+def expected_component_function(intensity: float, states: list[FragilityState], intact_value: float = 1.0) -> float:
+    """公式（5）：多状态基础设施期望功能。"""
+
+    exceed = np.array([fragility_probability(intensity, s.median, s.beta) for s in states])
+    exceed = np.maximum.accumulate(exceed)
+    probabilities = [exceed[0]]
+    for i in range(len(exceed) - 1):
+        probabilities.append(max(exceed[i + 1] - exceed[i], 0.0))
+    probabilities.append(max(1.0 - exceed[-1], 0.0))
+    probabilities = np.array(probabilities) / max(sum(probabilities), 1e-12)
+    values = np.array([s.function_value for s in states] + [intact_value])
+    return float(np.dot(probabilities, values))
+
+
+def distance_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    _, _, distance = GEOD.inv(lon1, lat1, lon2, lat2)
+    return float(distance)
+
+
+def bearing_deg(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    azimuth, _, _ = GEOD.inv(lon1, lat1, lon2, lat2)
+    return float(azimuth % 360.0)
+
+
+def folded_angle_0_90(angle_a: float, angle_b: float) -> float:
+    diff = abs((angle_a - angle_b + 180.0) % 360.0 - 180.0)
+    return min(diff, 180.0 - diff)
+
+
+def nearest_direction_bin(angle: float) -> float:
+    bins = np.asarray(sorted(TOWER_DIRECTIONAL_FRAGILITY), dtype=float)
+    return float(bins[np.argmin(np.abs(bins - angle))])
+
+
+def tower_failure_probability(wind_speed_ms: float, relative_wind_direction_deg: float) -> float:
+    direction = nearest_direction_bin(relative_wind_direction_deg)
+    log_median, beta = TOWER_DIRECTIONAL_FRAGILITY[direction]
+    return fragility_probability_log_median(wind_speed_ms, log_median, beta)
+
+
+def damage_level_from_count(count: float, eps: float = 1e-2) -> str:
+    """Line damage level used by the paper: 0 normal, <3 slight, >=3 severe."""
+
+    if count <= eps:
+        return "normal"
+    if count < 3:
+        return "slight"
+    return "severe"
+
+
+def compute_wind_time_series(track: pd.DataFrame, exposure_points: pd.DataFrame) -> pd.DataFrame:
+    """把台风路径映射到暴露点，输出时序风速矩阵。"""
+
+    rows = []
+    for _, point in track.iterrows():
+        row = {"time": point["time"]}
+        for _, asset in exposure_points.iterrows():
+            d = distance_m(point["lon"], point["lat"], asset["lon"], asset["lat"])
+            row[str(asset["id"])] = wind_speed_at_height_ms(
+                distance_to_center_m=d,
+                height_m=float(asset.get("height_m", 44.0)),
+                center_pressure_hpa=float(point["center_pressure_hpa"]),
+                latitude_deg=float(point["lat"]),
+                movement_speed_ms=float(point.get("movement_speed_ms", 0.0)),
+                max_wind_ms=point.get("max_wind_speed_ms", None),
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def read_zhuhai_assets() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, pd.DataFrame]:
+    """读取珠海发电厂、变电站、杆塔、线路、市界和手工网络 Excel。"""
+
+    plant_files = [
+        ("wind", "plant_wind.shp"),
+        ("solar", "plant_solar.shp"),
+        ("bio", "plant_bio.shp"),
+        ("oilgas", "plant_oilgas.shp"),
+        ("coal", "plant_coal.shp"),
+    ]
+    plants = []
+    for plant_type, file_name in plant_files:
+        gdf = gpd.read_file(RAW_DIR / file_name).to_crs("EPSG:4326")
+        gdf["plant_type"] = plant_type
+        plants.append(gdf)
+    plants_gdf = pd.concat(plants, ignore_index=True)
+    plants_gdf = gpd.GeoDataFrame(plants_gdf, geometry="geometry", crs="EPSG:4326")
+
+    substations = gpd.read_file(RAW_DIR / "substations.shp").to_crs("EPSG:4326")
+    towers = gpd.read_file(RAW_DIR / "towers.shp").to_crs("EPSG:4326")
+    lines = gpd.read_file(RAW_DIR / "lines.shp").to_crs("EPSG:4326")
+    manual = pd.read_excel(RAW_DIR / "manual_network.xlsx", sheet_name="Sheet1")
+    return plants_gdf, substations, towers, lines, manual
+
+
+def get_capacity(row: pd.Series) -> float:
+    value = row.get("Capacity__", 0.0)
+    try:
+        return float(value) if pd.notna(value) else 0.0
+    except Exception:
+        return 0.0
+
+
+def build_zhuhai_network() -> tuple[PowerNetwork, pd.DataFrame, pd.DataFrame]:
+    """按手工 Excel 构建珠海电力网络，并输出节点表和边表。"""
+
+    plants, substations, towers, lines, manual = read_zhuhai_assets()
+    network = PowerNetwork()
+    node_rows = []
+
+    for _, row in plants.iterrows():
+        node_id = str(row["ID"])
+        capacity = get_capacity(row)
+        lon = float(row.geometry.x)
+        lat = float(row.geometry.y)
+        network.add_node(Node(node_id, "plant", generation=capacity))
+        node_rows.append({"id": node_id, "type": "plant", "lon": lon, "lat": lat, "generation": capacity, "load": 0.0})
+
+    # Excel 中变电站使用 S0, S1...，这里按 shp 当前顺序映射。
+    for idx, row in substations.reset_index(drop=True).iterrows():
+        node_id = f"S{idx}"
+        lon = float(row.geometry.x)
+        lat = float(row.geometry.y)
+        voltage = row.get("voltage_1", row.get("voltage", 0))
+        load_proxy = float(voltage) / 1000.0 if pd.notna(voltage) else 1.0
+        network.add_node(Node(node_id, "substation", load=load_proxy))
+        node_rows.append({"id": node_id, "type": "substation", "lon": lon, "lat": lat, "generation": 0.0, "load": load_proxy})
+
+    node_df = pd.DataFrame(node_rows)
+    node_xy = {row["id"]: (row["lon"], row["lat"]) for _, row in node_df.iterrows()}
+    edge_rows = []
+    tower_col = manual.columns[7]
+    tower_id_col = towers.columns[0]
+    tower_to_line = {
+        f"T{int(row[tower_id_col])}": int(row["FID_PowerT"])
+        for _, row in towers.iterrows()
+        if pd.notna(row.get("FID_PowerT"))
+    }
+    line_lengths = {int(row["FID_PowerT"]): float(row["aplength"]) for _, row in lines.iterrows()}
+    for idx, row in manual.iterrows():
+        source = str(row["source"])
+        target = str(row["target"])
+        if source not in network.nodes or target not in network.nodes:
+            continue
+        sx, sy = node_xy[source]
+        tx, ty = node_xy[target]
+        length = distance_m(sx, sy, tx, ty)
+        edge_id = f"L{idx}"
+        network.add_edge(Edge(edge_id, source, target, length))
+        tower_text = "" if pd.isna(row.get(tower_col)) else str(row.get(tower_col))
+        tower_ids = re.findall(r"T\d+", tower_text)
+        line_fids = [tower_to_line[tower_id] for tower_id in tower_ids if tower_id in tower_to_line]
+        line_fid = max(set(line_fids), key=line_fids.count) if line_fids else np.nan
+        if pd.notna(line_fid) and line_fid in line_lengths:
+            length = line_lengths[int(line_fid)]
+            network.edges[edge_id].length = length
+        edge_rows.append(
+            {
+                "edge_id": edge_id,
+                "source": source,
+                "target": target,
+                "length_m": length,
+                "voltage_kv": row.get("line voltage(kv)", np.nan),
+                "tower_count": len(tower_ids),
+                "tower_ids": ",".join(tower_ids),
+                "line_fid": line_fid,
+            }
+        )
+
+    edge_df = pd.DataFrame(edge_rows)
+    return network, node_df, edge_df
+
+
+def build_tower_exposure(towers: gpd.GeoDataFrame) -> pd.DataFrame:
+    """Build tower exposure points with IDs matching the manual Excel, e.g. T13."""
+
+    tower_id_col = towers.columns[0]
+    exposure = pd.DataFrame(
+        {
+            "id": "T" + towers[tower_id_col].astype(int).astype(str),
+            "lon": towers.geometry.x.astype(float),
+            "lat": towers.geometry.y.astype(float),
+            "height_m": 44.0,
+        }
+    )
+    return exposure.drop_duplicates(subset=["id"]).reset_index(drop=True)
+
+
+def parse_tower_ids(value: object) -> list[str]:
+    if pd.isna(value):
+        return []
+    return re.findall(r"T\d+", str(value))
+
+
+def edge_bearing(edge: pd.Series, xy: dict[str, tuple[float, float]]) -> float:
+    source = edge["source"]
+    target = edge["target"]
+    if source in xy and target in xy:
+        sx, sy = xy[source]
+        tx, ty = xy[target]
+        return bearing_deg(sx, sy, tx, ty)
+    return 0.0
+
+
+def read_hato_track() -> pd.DataFrame:
+    """读取 ArcGIS Default.gdb 中的天鸽 HATO 轨迹图层 Export_Output_2。"""
+
+    gdf = gpd.read_file(r"C:/Users/86151/Documents/ArcGIS/Default.gdb", layer="Export_Output_2")
+    df = pd.DataFrame(gdf.drop(columns="geometry"))
+    df["time"] = pd.to_datetime(df["ISO_TIME"])
+    df["lon"] = pd.to_numeric(df["LON"], errors="coerce")
+    df["lat"] = pd.to_numeric(df["LAT"], errors="coerce")
+
+    pressure = pd.to_numeric(df["WMO_PRES"], errors="coerce")
+    for col in ["CMA_PRES", "TOK_PRES", "USA_PRES"]:
+        pressure = pressure.mask((pressure <= 0) | pressure.isna(), pd.to_numeric(df[col], errors="coerce"))
+    df["center_pressure_hpa"] = pressure.mask(pressure <= 0).ffill().bfill()
+
+    df["movement_speed_ms"] = pd.to_numeric(df["STORM_SPD"], errors="coerce").fillna(0.0) * 0.514444
+    wind = pd.to_numeric(df["WMO_WIND"], errors="coerce")
+    for col in ["CMA_WIND", "TOK_WIND", "USA_WIND"]:
+        wind = wind.mask((wind <= 0) | wind.isna(), pd.to_numeric(df[col], errors="coerce"))
+    df["max_wind_speed_ms"] = wind.mask(wind <= 0) * 0.514444
+    return df[["time", "lon", "lat", "center_pressure_hpa", "movement_speed_ms", "max_wind_speed_ms"]].dropna(subset=["lon", "lat"])
+
+
+def safe_to_csv(df: pd.DataFrame, path: Path) -> Path:
+    """Write CSV, falling back to *_updated.csv if the target is open in Excel."""
+
+    try:
+        df.to_csv(path, index=False, encoding="utf-8-sig")
+        return path
+    except PermissionError:
+        fallback = path.with_name(f"{path.stem}_updated{path.suffix}")
+        df.to_csv(fallback, index=False, encoding="utf-8-sig")
+        print(f"Warning: {path} is locked. Wrote {fallback} instead.")
+        return fallback
+
+
+def write_wind_diagnosis(
+    track: pd.DataFrame,
+    nodes: pd.DataFrame,
+    towers: pd.DataFrame,
+    node_wind: pd.DataFrame,
+    tower_wind: pd.DataFrame,
+) -> None:
+    """Save key wind-field diagnostics to explain whether the scenario is weak."""
+
+    pressure_vmax = track.apply(
+        lambda row: max_wind_speed_ms(
+            float(row["center_pressure_hpa"]),
+            float(row["lat"]),
+            float(row.get("movement_speed_ms", 0.0)),
+        ),
+        axis=1,
+    )
+
+    def min_track_distance(exposure: pd.DataFrame) -> float:
+        best = float("inf")
+        for _, point in track.iterrows():
+            for _, asset in exposure.iterrows():
+                best = min(best, distance_m(point["lon"], point["lat"], asset["lon"], asset["lat"]))
+        return best
+
+    node_values = node_wind.drop(columns=["time"], errors="ignore")
+    tower_values = tower_wind.drop(columns=["time"], errors="ignore")
+    node_max = float(node_values.max().max()) if not node_values.empty else 0.0
+    tower_max = float(tower_values.max().max()) if not tower_values.empty else 0.0
+    diagnosis = pd.DataFrame(
+        [
+            {
+                "track_data_max_wind_ms": float(track["max_wind_speed_ms"].max(skipna=True)),
+                "track_data_max_wind_kmh": float(track["max_wind_speed_ms"].max(skipna=True) * 3.6),
+                "minimum_center_pressure_hpa": float(track["center_pressure_hpa"].min()),
+                "pressure_model_max_vmax_ms": float(pressure_vmax.max()),
+                "pressure_model_max_vmax_kmh": float(pressure_vmax.max() * 3.6),
+                "max_node_wind_ms": node_max,
+                "max_tower_wind_ms": tower_max,
+                "max_all_facility_wind_ms": max(node_max, tower_max),
+                "nearest_track_to_node_m": min_track_distance(nodes[["id", "lon", "lat"]]),
+                "nearest_track_to_tower_m": min_track_distance(towers[["id", "lon", "lat"]]),
+            }
+        ]
+    )
+    safe_to_csv(diagnosis, OUTPUT_DIR / "wind_diagnosis.csv")
+
+
+def compute_edge_function_from_towers(
+    edge: pd.Series,
+    tower_row: pd.Series,
+    tower_exposure: pd.DataFrame,
+    track_point: pd.Series,
+    line_bearing: float,
+) -> tuple[float, float, float, np.ndarray, list[dict[str, object]]]:
+    """Use Table 2 directional fragility curves and per-tower damage statistics."""
+
+    tower_ids = [tower_id for tower_id in parse_tower_ids(edge.get("tower_ids")) if tower_id in tower_row.index]
+    if not tower_ids:
+        return np.nan, np.nan, np.nan, np.asarray([]), []
+
+    tower_xy = tower_exposure.set_index("id")[["lon", "lat"]]
+    edge_id = edge.get("edge_id", edge.name)
+    failure_probs = []
+    detail_rows = []
+    for tower_id in tower_ids:
+        wind_speed = float(tower_row[tower_id])
+        tower_lon = float(tower_xy.loc[tower_id, "lon"])
+        tower_lat = float(tower_xy.loc[tower_id, "lat"])
+        radial_bearing = bearing_deg(float(track_point["lon"]), float(track_point["lat"]), tower_lon, tower_lat)
+        local_wind_direction = (radial_bearing + 90.0) % 360.0
+        relative_direction = folded_angle_0_90(local_wind_direction, line_bearing)
+        direction_bin = nearest_direction_bin(relative_direction)
+        selected_mu, selected_beta = TOWER_DIRECTIONAL_FRAGILITY[direction_bin]
+        failure_probability = fragility_probability_log_median(wind_speed, selected_mu, selected_beta)
+        failure_probs.append(failure_probability)
+        detail_rows.append(
+            {
+                "time": track_point["time"],
+                "edge_id": edge_id,
+                "tower_id": tower_id,
+                "tower_wind_ms": wind_speed,
+                "line_bearing": line_bearing,
+                "local_wind_direction": local_wind_direction,
+                "relative_direction": relative_direction,
+                "direction_bin": direction_bin,
+                "selected_mu": selected_mu,
+                "selected_beta": selected_beta,
+                "tower_failure_probability": failure_probability,
+            }
+        )
+
+    probabilities = np.asarray(failure_probs, dtype=float)
+    line_survival_probability = float(np.prod(1.0 - probabilities))
+    expected_failed_towers = float(probabilities.sum())
+    max_tower_failure_probability = float(probabilities.max())
+    return line_survival_probability, expected_failed_towers, max_tower_failure_probability, probabilities, detail_rows
+
+
+def simulate_zhuhai_hato() -> None:
+    """构建珠海网络，并在天鸽轨迹上做一次失效演化仿真。"""
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    network, nodes, edges = build_zhuhai_network()
+    _, _, towers, _, _ = read_zhuhai_assets()
+    baseline = network.functional_metrics()
+    track = read_hato_track()
+
+    exposure = nodes[["id", "lon", "lat"]].copy()
+    exposure["height_m"] = 44.0
+    wind_matrix = compute_wind_time_series(track, exposure)
+    safe_to_csv(wind_matrix, OUTPUT_DIR / "zhuhai_hato_wind_timeseries.csv")
+    tower_exposure = build_tower_exposure(towers)
+    tower_wind_matrix = compute_wind_time_series(track, tower_exposure)
+    safe_to_csv(tower_wind_matrix, OUTPUT_DIR / "zhuhai_hato_tower_wind_timeseries.csv")
+    write_wind_diagnosis(track, nodes, tower_exposure, wind_matrix, tower_wind_matrix)
+
+    cumulative = wind_matrix.drop(columns=["time"]).cummax()
+    tower_cumulative = tower_wind_matrix.drop(columns=["time"]).cummax()
+    timeline_rows = []
+    cumulative_edge_functions = {edge_id: 1.0 for edge_id in edges["edge_id"]}
+    cumulative_expected_failed_towers = {edge_id: 0.0 for edge_id in edges["edge_id"]}
+    cumulative_max_tower_failure_probability = {edge_id: 0.0 for edge_id in edges["edge_id"]}
+    cumulative_mc_mean_damaged = {edge_id: 0.0 for edge_id in edges["edge_id"]}
+    cumulative_mc_slight_probability = {edge_id: 0.0 for edge_id in edges["edge_id"]}
+    cumulative_mc_severe_probability = {edge_id: 0.0 for edge_id in edges["edge_id"]}
+    failure_times = {}
+    tower_failure_detail_rows = []
+    rng = np.random.default_rng(RANDOM_SEED)
+    edge_lookup = edges.set_index("edge_id")
+    node_xy = {node["id"]: (node["lon"], node["lat"]) for _, node in nodes.iterrows()}
+    for i, row in cumulative.iterrows():
+        tower_row = tower_cumulative.iloc[i]
+        track_point = track.iloc[i]
+        damaged_network = network.copy()
+        for node_id in nodes["id"]:
+            intensity = float(row[node_id])
+            damaged_network.nodes[node_id].function_state = expected_component_function(intensity, PLANT_SUBSTATION_FRAGILITY)
+
+        damaged_edge_count = 0
+        for edge in damaged_network.edges.values():
+            edge_meta = edge_lookup.loc[edge.edge_id]
+            line_bearing = edge_bearing(edge_meta, node_xy)
+            edge_function, expected_failed, max_pf, tower_probabilities, detail_rows = compute_edge_function_from_towers(
+                edge_meta,
+                tower_row,
+                tower_exposure,
+                track_point,
+                line_bearing,
+            )
+            tower_failure_detail_rows.extend(detail_rows)
+            if pd.isna(edge_function):
+                intensity = max(float(row[edge.from_id]), float(row[edge.to_id]))
+                edge_function = expected_component_function(intensity, PLANT_SUBSTATION_FRAGILITY)
+                expected_failed = 0.0
+                max_pf = 1.0 - edge_function
+                tower_probabilities = np.asarray([])
+
+            if SIMULATION_MODE == "monte_carlo" and len(tower_probabilities) > 0:
+                samples = rng.random((MONTE_CARLO_SAMPLES, len(tower_probabilities))) < tower_probabilities
+                damaged_counts = samples.sum(axis=1)
+                mean_damaged = float(damaged_counts.mean())
+                slight_probability = float(((damaged_counts > 0) & (damaged_counts < 3)).mean())
+                severe_probability = float((damaged_counts >= 3).mean())
+                edge_function = float((damaged_counts == 0).mean() + 0.8 * slight_probability)
+                cumulative_mc_mean_damaged[edge.edge_id] = max(cumulative_mc_mean_damaged[edge.edge_id], mean_damaged)
+                cumulative_mc_slight_probability[edge.edge_id] = max(cumulative_mc_slight_probability[edge.edge_id], slight_probability)
+                cumulative_mc_severe_probability[edge.edge_id] = max(cumulative_mc_severe_probability[edge.edge_id], severe_probability)
+
+            cumulative_edge_functions[edge.edge_id] = min(cumulative_edge_functions[edge.edge_id], edge_function)
+            cumulative_expected_failed_towers[edge.edge_id] = max(cumulative_expected_failed_towers[edge.edge_id], expected_failed)
+            cumulative_max_tower_failure_probability[edge.edge_id] = max(cumulative_max_tower_failure_probability[edge.edge_id], max_pf)
+            edge.function_state = cumulative_edge_functions[edge.edge_id]
+            if edge.function_state < 0.99 and edge.edge_id not in failure_times:
+                failure_times[edge.edge_id] = wind_matrix.loc[i, "time"]
+            if edge.function_state < 0.99:
+                damaged_edge_count += 1
+
+        metrics = damaged_network.functional_metrics(baseline=baseline)
+        timeline_rows.append(
+            {
+                "time": wind_matrix.loc[i, "time"],
+                "max_wind_ms": float(row.max()),
+                "max_node_wind_ms": float(row.max()),
+                "max_tower_wind_ms": float(tower_row.max()),
+                "KTE": metrics.kte,
+                "KTR": metrics.ktr,
+                "KLC": metrics.klc,
+                "KTE_norm": safe_ratio(metrics.kte, baseline.kte),
+                "KTR_norm": safe_ratio(metrics.ktr, baseline.ktr),
+                "KLC_norm": safe_ratio(metrics.klc, baseline.klc),
+                "K": metrics.k,
+                "function_percent": metrics.k * 100.0,
+                "damaged_edge_count": damaged_edge_count,
+            }
+        )
+
+    safe_to_csv(nodes, OUTPUT_DIR / "zhuhai_network_nodes.csv")
+    safe_to_csv(pd.DataFrame(tower_failure_detail_rows), OUTPUT_DIR / "tower_failure_details.csv")
+    if not edges.empty:
+        edges["final_function_state"] = edges["edge_id"].map(cumulative_edge_functions)
+        edges["expected_failed_towers"] = edges["edge_id"].map(cumulative_expected_failed_towers)
+        edges["damage_level_expected"] = edges["expected_failed_towers"].apply(damage_level_from_count)
+        edges["max_tower_failure_probability"] = edges["edge_id"].map(cumulative_max_tower_failure_probability)
+        if SIMULATION_MODE == "monte_carlo":
+            edges["mean_damaged_tower_count"] = edges["edge_id"].map(cumulative_mc_mean_damaged)
+            edges["mean_slight_damage_probability"] = edges["edge_id"].map(cumulative_mc_slight_probability)
+            edges["mean_severe_damage_probability"] = edges["edge_id"].map(cumulative_mc_severe_probability)
+        edges["is_damaged"] = edges["final_function_state"] < 0.99
+        edges["failure_time"] = edges["edge_id"].map(failure_times)
+        failed_order = (
+            edges[edges["is_damaged"] & edges["failure_time"].notna()]
+            .sort_values(["failure_time", "edge_id"])
+            .reset_index(drop=True)
+        )
+        order_map = {edge_id: order + 1 for order, edge_id in enumerate(failed_order["edge_id"])}
+        edges["failure_order"] = edges["edge_id"].map(order_map)
+    safe_to_csv(edges, OUTPUT_DIR / "zhuhai_network_edges.csv")
+    timeline = pd.DataFrame(timeline_rows)
+    safe_to_csv(timeline, OUTPUT_DIR / "zhuhai_hato_failure_timeline.csv")
+
+    print("Zhuhai network built.")
+    print(network.summary())
+    print(f"Valid edges: {len(edges)} / original Excel rows: 60")
+    print("Output: outputs/zhuhai_network_nodes.csv")
+    print("Output: outputs/zhuhai_network_edges.csv")
+    print("Output: outputs/tower_failure_details.csv")
+    print("Output: outputs/zhuhai_hato_wind_timeseries.csv")
+    print("Output: outputs/zhuhai_hato_tower_wind_timeseries.csv")
+    print("Output: outputs/wind_diagnosis.csv")
+    print("Output: outputs/zhuhai_hato_failure_timeline.csv")
+    print(f"Max node wind speed during HATO: {timeline['max_node_wind_ms'].max():.2f} m/s")
+    print(f"Max tower wind speed during HATO: {timeline['max_tower_wind_ms'].max():.2f} m/s")
+    print(f"Minimum system function: {timeline['function_percent'].min():.2f}%")
+    print(f"Damaged edges under current fragility parameters: {int(edges['is_damaged'].sum()) if 'is_damaged' in edges else 0}")
+    print(f"Simulation mode: {SIMULATION_MODE}")
+
+    plot_zhuhai_network(nodes, edges, towers, track)
+    plot_zhuhai_timelines(timeline)
+
+
+def plot_zhuhai_network(
+    nodes: pd.DataFrame,
+    edges: pd.DataFrame,
+    towers: gpd.GeoDataFrame,
+    track: pd.DataFrame,
+) -> None:
+    """输出一张珠海设施网络图，方便先检查网络是否搭对。"""
+
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+        from shapely.geometry import LineString, box
+
+        boundary = gpd.read_file(RAW_DIR / "zhuhai_boundary.shp").to_crs("EPSG:4326")
+        minx, miny, maxx, maxy = boundary.total_bounds
+        pad_x = (maxx - minx) * 0.08
+        pad_y = (maxy - miny) * 0.08
+        plot_minx = minx - pad_x
+        plot_maxx = maxx + pad_x
+        plot_miny = miny - pad_y
+        plot_maxy = maxy + pad_y
+        track_buffer_x = 0.8
+        track_buffer_y = 0.8
+        track_local = track[
+            (track["lon"] >= minx - track_buffer_x)
+            & (track["lon"] <= maxx + track_buffer_x)
+            & (track["lat"] >= miny - track_buffer_y)
+            & (track["lat"] <= maxy + track_buffer_y)
+        ].copy()
+        if len(track_local) < 2:
+            track_buffer_x = 1.2
+            track_buffer_y = 1.2
+            track_local = track[
+                (track["lon"] >= minx - track_buffer_x)
+                & (track["lon"] <= maxx + track_buffer_x)
+                & (track["lat"] >= miny - track_buffer_y)
+                & (track["lat"] <= maxy + track_buffer_y)
+            ].copy()
+
+        fig, ax = plt.subplots(figsize=(9, 8))
+        boundary.boundary.plot(ax=ax, color="black", linewidth=1)
+        xy = {row["id"]: (row["lon"], row["lat"]) for _, row in nodes.iterrows()}
+        lines_gdf = gpd.read_file(RAW_DIR / "lines.shp").to_crs("EPSG:4326")
+        line_geometries = {int(row["FID_PowerT"]): row.geometry for _, row in lines_gdf.iterrows()}
+
+        def plot_edge_geometry(edge: pd.Series, color: str, linewidth: float, alpha: float, zorder: int) -> None:
+            line_fid = edge.get("line_fid", np.nan)
+            if pd.notna(line_fid) and int(line_fid) in line_geometries:
+                geometry = line_geometries[int(line_fid)]
+                geometries = list(geometry.geoms) if geometry.geom_type == "MultiLineString" else [geometry]
+                for geom in geometries:
+                    xs, ys = geom.xy
+                    ax.plot(xs, ys, color=color, linewidth=linewidth, alpha=alpha, zorder=zorder)
+                return
+            if edge["source"] in xy and edge["target"] in xy:
+                sx, sy = xy[edge["source"]]
+                tx, ty = xy[edge["target"]]
+                ax.plot([sx, tx], [sy, ty], color=color, linewidth=linewidth, alpha=alpha, zorder=zorder)
+
+        def edge_is_failed(edge: pd.Series) -> bool:
+            return str(edge.get("is_damaged", False)).lower() in {"true", "1"}
+
+        normal_edges = edges[~edges.apply(edge_is_failed, axis=1)]
+        failed_edges = edges[edges.apply(edge_is_failed, axis=1)]
+
+        for _, edge in normal_edges.iterrows():
+            plot_edge_geometry(edge, color="#6c757d", linewidth=1, alpha=0.65, zorder=1)
+
+        for _, edge in failed_edges.iterrows():
+            if edge["source"] not in xy or edge["target"] not in xy:
+                continue
+            plot_edge_geometry(edge, color="red", linewidth=1.8, alpha=0.95, zorder=4)
+            if pd.notna(edge.get("failure_order", np.nan)):
+                line_fid = edge.get("line_fid", np.nan)
+                if pd.notna(line_fid) and int(line_fid) in line_geometries:
+                    midpoint = line_geometries[int(line_fid)].interpolate(0.5, normalized=True)
+                    mx, my = midpoint.x, midpoint.y
+                else:
+                    sx, sy = xy[edge["source"]]
+                    tx, ty = xy[edge["target"]]
+                    mx = (sx + tx) / 2.0
+                    my = (sy + ty) / 2.0
+                ax.text(
+                    mx,
+                    my,
+                    str(int(edge["failure_order"])),
+                    fontsize=7,
+                    color="darkred",
+                    ha="center",
+                    va="center",
+                    zorder=6,
+                    bbox={"boxstyle": "round,pad=0.12", "fc": "white", "ec": "none", "alpha": 0.75},
+                )
+        plants = nodes[nodes["type"] == "plant"]
+        substations = nodes[nodes["type"] == "substation"]
+        ax.scatter(plants["lon"], plants["lat"], s=18, c="#f4a261", marker="o", label="plants", zorder=3)
+        ax.scatter(substations["lon"], substations["lat"], s=22, c="#2a9d8f", marker="o", label="substations", zorder=3)
+        ax.scatter(
+            towers.geometry.x,
+            towers.geometry.y,
+            s=5,
+            facecolors="none",
+            edgecolors="#277da1",
+            linewidths=0.35,
+            marker="^",
+            label="towers",
+            alpha=0.45,
+            zorder=2,
+        )
+
+        if len(track_local) >= 2:
+            map_box = box(plot_minx, plot_miny, plot_maxx, plot_maxy)
+            clipped = LineString(list(zip(track_local["lon"], track_local["lat"]))).intersection(map_box)
+            if not clipped.is_empty:
+                segments = [clipped] if clipped.geom_type == "LineString" else list(clipped.geoms)
+                for segment in segments:
+                    coords = list(segment.coords)
+                    if len(coords) < 2:
+                        continue
+                    xs, ys = zip(*coords)
+                    ax.plot(xs, ys, color="blue", linestyle="--", linewidth=1.5, alpha=0.8, label="typhoon path", zorder=3)
+                    ax.scatter(xs, ys, s=12, c="blue", alpha=0.8, zorder=3)
+                    start = coords[0]
+                    end = coords[-1]
+                    ax.annotate(
+                        "",
+                        xy=end,
+                        xytext=start,
+                        arrowprops={"arrowstyle": "->", "color": "blue", "lw": 1.0, "alpha": 0.8},
+                        zorder=3,
+                        clip_on=True,
+                    )
+                visible_points = track_local[
+                    (track_local["lon"] >= plot_minx)
+                    & (track_local["lon"] <= plot_maxx)
+                    & (track_local["lat"] >= plot_miny)
+                    & (track_local["lat"] <= plot_maxy)
+                ]
+                step = 2 if len(visible_points) <= 12 else 3
+                for local_order, (_, point) in enumerate(visible_points.iloc[::step].iterrows(), start=1):
+                    ax.text(point["lon"], point["lat"], str(local_order), fontsize=6, color="blue", zorder=5, clip_on=True)
+
+        legend_handles = [
+            Line2D([0], [0], color="#6c757d", lw=1.5, label="normal lines"),
+            Line2D([0], [0], color="red", lw=1.5, label="failed lines"),
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="#f4a261", markersize=6, label="plants"),
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="#2a9d8f", markersize=6, label="substations"),
+            Line2D([0], [0], marker="^", color="#277da1", markerfacecolor="none", markeredgecolor="#277da1", linestyle="None", markersize=5, label="towers"),
+            Line2D([0], [0], color="#1d4ed8", linestyle="--", lw=1.4, label="typhoon path"),
+        ]
+        ax.set_title("Zhuhai power infrastructure network")
+        ax.set_xlabel("longitude")
+        ax.set_ylabel("latitude")
+        ax.legend(handles=legend_handles, loc="best", fontsize=8)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(plot_minx, plot_maxx)
+        ax.set_ylim(plot_miny, plot_maxy)
+        fig.tight_layout()
+        fig.savefig(OUTPUT_DIR / "zhuhai_network_map.png", dpi=200)
+        plt.close(fig)
+        print("Output: outputs/zhuhai_network_map.png")
+    except Exception as exc:
+        print(f"Map output skipped: {exc}")
+
+
+def plot_zhuhai_timelines(timeline: pd.DataFrame) -> None:
+    """Output diagnostic figures for function, metrics, wind, and damage count."""
+
+    try:
+        import matplotlib.pyplot as plt
+
+        time = pd.to_datetime(timeline["time"])
+
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        ax.plot(time, timeline["function_percent"], color="#d62828", linewidth=1.8)
+        min_idx = timeline["function_percent"].idxmin()
+        ax.scatter(time.loc[min_idx], timeline.loc[min_idx, "function_percent"], color="#d62828", s=28, zorder=3)
+        ax.annotate(
+            f"min={timeline.loc[min_idx, 'function_percent']:.2f}%",
+            xy=(time.loc[min_idx], timeline.loc[min_idx, "function_percent"]),
+            xytext=(8, 8),
+            textcoords="offset points",
+            fontsize=8,
+        )
+        ax.set_title("Zhuhai system function timeline")
+        ax.set_xlabel("time")
+        ax.set_ylabel("function (%)")
+        ax.grid(alpha=0.25)
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        fig.savefig(OUTPUT_DIR / "zhuhai_function_timeline.png", dpi=200)
+        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        ax.plot(time, timeline["KTE_norm"], label="KTE_norm", linewidth=1)
+        ax.plot(time, timeline["KTR_norm"], label="KTR_norm", linewidth=1)
+        ax.plot(time, timeline["KLC_norm"], label="KLC_norm", linewidth=1)
+        ax.set_title("Zhuhai normalized functional metrics")
+        ax.set_xlabel("time")
+        ax.set_ylabel("normalized value")
+        ax.legend()
+        ax.grid(alpha=0.25)
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        fig.savefig(OUTPUT_DIR / "zhuhai_metrics_timeline.png", dpi=200)
+        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        ax.plot(time, timeline["max_node_wind_ms"], label="max node wind", linewidth=1)
+        ax.plot(time, timeline["max_tower_wind_ms"], label="max tower wind", linewidth=1)
+        ax.set_title("Zhuhai maximum wind timeline")
+        ax.set_xlabel("time")
+        ax.set_ylabel("wind speed (m/s)")
+        ax.legend()
+        ax.grid(alpha=0.25)
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        fig.savefig(OUTPUT_DIR / "zhuhai_wind_timeline.png", dpi=200)
+        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        ax.step(time, timeline["damaged_edge_count"], where="post", color="#7b2cbf", linewidth=1)
+        ax.set_title("Zhuhai damaged line count timeline")
+        ax.set_xlabel("time")
+        ax.set_ylabel("damaged line count")
+        ax.grid(alpha=0.25)
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        fig.savefig(OUTPUT_DIR / "zhuhai_damage_count_timeline.png", dpi=200)
+        plt.close(fig)
+
+        print("Output: outputs/zhuhai_function_timeline.png")
+        print("Output: outputs/zhuhai_metrics_timeline.png")
+        print("Output: outputs/zhuhai_wind_timeline.png")
+        print("Output: outputs/zhuhai_damage_count_timeline.png")
+    except Exception as exc:
+        print(f"Timeline figures skipped: {exc}")
+
+
+def demo_network() -> PowerNetwork:
+    network = PowerNetwork()
+    network.add_node(Node("P1", "plant", generation=100))
+    network.add_node(Node("S1", "substation", load=60))
+    network.add_node(Node("B1", "bus", load=40))
+    network.add_edge(Edge("L1", "P1", "S1", 10))
+    network.add_edge(Edge("L2", "S1", "B1", 12))
+    return network
+
+
+def main() -> None:
+    print("failure_evolution.py is running.")
+
+    if (RAW_DIR / "manual_network.xlsx").exists():
+        simulate_zhuhai_hato()
+        return
+
+    k_component = expected_component_function(35.0, PLANT_SUBSTATION_FRAGILITY)
+    print(f"35 m/s 风速下，组件期望功能 k = {k_component:.3f}")
+
+    wind = wind_speed_at_height_ms(
+        distance_to_center_m=20_000,
+        height_m=44,
+        center_pressure_hpa=950,
+        latitude_deg=22,
+        movement_speed_ms=5,
+    )
+    print(f"示例台风下，20 km 处、44 m 高度风速 = {wind:.2f} m/s")
+
+    network = demo_network()
+    baseline = network.functional_metrics()
+    network.edges["L2"].function_state = 0.0
+    damaged = network.functional_metrics(baseline=baseline)
+    print(f"线路 L2 失效后，系统综合功能 K = {damaged.k:.3f}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        input("\n运行结束。按回车退出...")
