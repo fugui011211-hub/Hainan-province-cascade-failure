@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -36,6 +37,13 @@ JOURNAL = {
     "grid": "#E7E7E7",
     "grey": "#9AA1A6",
 }
+PAIR_BLUE = "#4198AC"
+PAIR_ORANGE = "#ED8D5A"
+PAIR_PALETTE = [PAIR_BLUE, PAIR_ORANGE]
+OCEAN_BREEZE_CMAP = LinearSegmentedColormap.from_list(
+    "ocean_breeze",
+    ["#BFD7D2", "#7BCCCD", "#4198AC", "#DBCB92", "#ECB66C", "#EA9E58", "#ED8D5A"],
+)
 
 
 def setup_plot_style():
@@ -462,8 +470,16 @@ def plot_pareto_bubble(pareto, selected, nsga_pareto=None, prefix="q2"):
 
 def plot_entropy_weights(weights_df):
     plt.figure(figsize=(8, 5.2))
-    palette = ["#2f6f9f", "#4aa96c", "#f0a202", "#d95d39"]
-    ax = sns.barplot(data=weights_df, x="criterion", y="weight", hue="criterion", palette=palette, legend=False)
+    palette = [JOURNAL["blue"], JOURNAL["teal"], JOURNAL["sand"], JOURNAL["coral"]]
+    ax = sns.barplot(
+        data=weights_df,
+        x="criterion",
+        y="weight",
+        hue="criterion",
+        palette=palette,
+        legend=False,
+        width=0.46,
+    )
     for container in ax.containers:
         ax.bar_label(container, fmt="%.3f", padding=3, fontsize=10)
     plt.xlabel("Entropy-TOPSIS criterion")
@@ -514,40 +530,17 @@ def plot_official_data_profile(clean_df):
     fig.legend(handles, labels, loc="upper center", ncol=3, bbox_to_anchor=(0.53, 0.98), frameon=False,fontsize=13,markerscale=1.4,)
     fig.suptitle(
         "Separation Performance Profiles under Different Current and Water-Flow Conditions",
-        x=0.02,
+        x=0.5,
         y=1.03,
-        ha="left",
+        ha="center",
         fontweight="bold",
     )
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     plt.savefig(OUT_DIR / "data_official_four_indicator_profile.png", dpi=300, bbox_inches="tight")
     plt.close()
-
-    long_df = plot_df.melt(
-        id_vars=["seq", "I", "W"],
-        value_vars=[col + "_norm" for col in indicators],
-        var_name="indicator",
-        value_name="normalized_value",
-    )
-    long_df["indicator"] = long_df["indicator"].str.replace("_norm", "", regex=False)
-    plt.figure(figsize=(10, 5.8))
-    sns.lineplot(
-        data=long_df,
-        x="W",
-        y="normalized_value",
-        hue="indicator",
-        style="I",
-        markers=True,
-        dashes=False,
-        linewidth=1.6,
-        alpha=0.88,
-    )
-    plt.xlabel("Upward water flow W / mL/s")
-    plt.ylabel("Min-max normalized value")
-    plt.title("Normalized Comparison of Four Separation Indicators")
-    plt.tight_layout()
-    plt.savefig(OUT_DIR / "data_normalized_indicator_comparison.png", dpi=300)
-    plt.close()
+    normalized_path = OUT_DIR / "data_normalized_indicator_comparison.png"
+    if normalized_path.exists():
+        normalized_path.unlink()
 
 
 def plot_response_surfaces(models, poly, selected):
@@ -583,21 +576,34 @@ def plot_profit_landscape(grid, econ_df):
     best = baseline.iloc[0]
     df = grid.copy()
     df["profit_yuan_h"] = profit_per_hour(df, 1.0, 1.0)
-    df.loc[(df["beta"] < 67) | (df["eps"] < 95), "profit_yuan_h"] = np.nan
-    sample = df.iloc[::18, :].copy()
-    pivot = sample.pivot_table(index="W", columns="I", values="profit_yuan_h")
+    df["feasible"] = (df["beta"] >= 67) & (df["eps"] >= 95)
+    pivot = df.pivot_table(index="W", columns="I", values="profit_yuan_h")
+    beta_pivot = df.pivot_table(index="W", columns="I", values="beta")
+    eps_pivot = df.pivot_table(index="W", columns="I", values="eps")
+    feasible_pivot = df.pivot_table(index="W", columns="I", values="feasible")
     x = pivot.columns.to_numpy()
     y = pivot.index.to_numpy()
     z = pivot.to_numpy()
+    beta_z = beta_pivot.to_numpy()
+    eps_z = eps_pivot.to_numpy()
+    feasible_z = feasible_pivot.to_numpy()
 
     plt.figure(figsize=(8.5, 6))
-    contour = plt.contourf(x, y, z, levels=18, cmap="YlGnBu")
+    levels = np.linspace(np.nanpercentile(z, 5), np.nanpercentile(z, 99), 22)
+    contour = plt.contourf(x, y, z, levels=levels, cmap="YlGnBu", alpha=0.92)
     plt.colorbar(contour, label="Profit / yuan per hour")
-    plt.contour(x, y, z, levels=8, colors="white", linewidths=0.55, alpha=0.65)
+    line_levels = np.linspace(np.nanpercentile(z, 20), np.nanpercentile(z, 98), 8)
+    cs = plt.contour(x, y, z, levels=line_levels, colors="white", linewidths=0.65, alpha=0.88)
+    plt.clabel(cs, inline=True, fontsize=7, fmt="%.0f")
+    plt.contour(x, y, beta_z, levels=[67], colors=PAIR_ORANGE, linewidths=1.35, linestyles="--")
+    plt.contour(x, y, eps_z, levels=[95], colors=PAIR_BLUE, linewidths=1.35, linestyles=":")
+    plt.contourf(x, y, feasible_z, levels=[0.5, 1.5], colors="none", hatches=["///"], alpha=0)
     plt.scatter(best["opt_I"], best["opt_W"], s=160, color="#d62728", marker="*", label="Economic optimum")
+    plt.xlim(I_BOUNDS[0] - 0.02, I_BOUNDS[1] + 0.03)
+    plt.ylim(W_BOUNDS[0] - 0.25, W_BOUNDS[1])
     plt.xlabel("Excitation current I / A")
     plt.ylabel("Upward water flow W / mL/s")
-    plt.title("Baseline Profit Landscape in Feasible Region")
+    plt.title("Baseline Profit Contour Landscape")
     plt.legend()
     plt.tight_layout()
     plt.savefig(OUT_DIR / "q3_profit_landscape_contour.png", dpi=300)
@@ -638,10 +644,10 @@ def plot_solution_comparison(selected, rf_selected, econ_df, rf_econ_df):
     ax.set_xticklabels(["Grade", "Yield", "Recovery", "Energy\n(low best)"])
     ax.set_ylim(-0.05, 1.05)
     ax.set_ylabel("Normalized decision score")
-    ax.set_title("Normalized comparison of recommended schemes", loc="left", fontweight="bold")
+    ax.set_title("Normalized comparison of recommended schemes", loc="center", fontweight="bold")
     polish_axis(ax)
-    ax.legend(ncol=2, loc="lower center", bbox_to_anchor=(0.5, -0.34))
-    fig.tight_layout()
+    ax.legend(ncol=4, loc="lower center", bbox_to_anchor=(0.5, -0.30), frameon=True, columnspacing=1.6)
+    fig.tight_layout(rect=[0, 0.08, 1, 1])
     plt.savefig(OUT_DIR / "solution_comparison_bars.png", dpi=300)
     plt.close()
 
@@ -658,7 +664,7 @@ def plot_strategy_phase(econ_df):
     plt.figure(figsize=(8.5, 5.6))
     ax = sns.heatmap(
         pivot,
-        cmap="mako",
+        cmap=OCEAN_BREEZE_CMAP,
         annot=True,
         fmt=".2f",
         cbar_kws={"label": "Optimal I / A"},
@@ -816,6 +822,79 @@ def plot_robustness(models, poly, selected, econ_df):
     return robust, robust_curve
 
 
+def plot_robustness_v2(models, poly, selected, econ_df):
+    _, _, robust = robustness_map(models, poly)
+    pivot = robust.pivot_table(index="W", columns="I", values="pass_probability")
+    x = pivot.columns.to_numpy()
+    y = pivot.index.to_numpy()
+    z = pivot.to_numpy()
+
+    fig, ax = plt.subplots(figsize=(8.5, 6))
+    mesh = ax.pcolormesh(x, y, z, cmap="YlGnBu", vmin=0, vmax=1, shading="auto")
+    fig.colorbar(mesh, ax=ax, label="Pass probability")
+    ax.contour(x, y, z, levels=[0.95], colors=JOURNAL["ink"], linewidths=1.1, linestyles="--")
+    ax.scatter(
+        selected["I"] + 0.080,
+        selected["W"] + 0.45,
+        s=300,
+        marker="*",
+        color="#FFD700",
+        edgecolor="#000000",
+        linewidth=1.2,
+        zorder=5,
+        clip_on=False,
+        label="Entropy-TOPSIS",
+    )
+    ax.set_xlim(I_BOUNDS[0] - 0.06, I_BOUNDS[1] + 0.02)
+    ax.set_ylim(W_BOUNDS[0] - 0.45, W_BOUNDS[1] + 0.15)
+    ax.set_title("Monte Carlo Robustness Heatmap under Process Disturbance")
+    ax.set_xlabel("Excitation current I / A")
+    ax.set_ylabel("Upward water flow W / mL/s")
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    plt.savefig(OUT_DIR / "q2_monte_carlo_robustness_heatmap.png", dpi=300)
+    plt.close()
+
+    robust_curve = robust_sensitivity(models, poly, selected, econ_df)
+    safe_to_csv(robust, OUT_DIR / "q2_robustness_map.csv")
+    safe_to_csv(robust_curve, OUT_DIR / "q2_robustness_sensitivity.csv")
+
+    fig, ax = plt.subplots(figsize=(7.8, 4.9))
+    scheme_colors = {"technical_entropy": JOURNAL["teal"], "economic_profit": JOURNAL["coral"]}
+    scheme_labels = {"technical_entropy": "Entropy-TOPSIS", "economic_profit": "Economic optimum"}
+    for scheme, group in robust_curve.groupby("scheme"):
+        group = group.sort_values("disturbance_scale")
+        ax.plot(
+            group["disturbance_scale"],
+            group["pass_probability"],
+            color=scheme_colors[scheme],
+            lw=2.2,
+            marker="o",
+            ms=4.5,
+            label=scheme_labels[scheme],
+        )
+        ax.fill_between(
+            group["disturbance_scale"].to_numpy(),
+            group["ci_low"].to_numpy(),
+            group["ci_high"].to_numpy(),
+            color=scheme_colors[scheme],
+            alpha=0.16,
+            linewidth=0,
+        )
+    ax.axhline(0.95, color=JOURNAL["grey"], lw=0.9, ls="--")
+    ax.text(2.40, 0.955, "95% target", ha="right", va="bottom", fontsize=8.5, color=JOURNAL["grey"])
+    ax.set_ylim(0.90, 1.01)
+    ax.set_xlabel("Disturbance scale")
+    ax.set_ylabel("Qualification probability")
+    ax.set_title("Robustness under process disturbance", loc="center", fontweight="bold")
+    polish_axis(ax)
+    ax.legend(loc="lower left")
+    fig.tight_layout()
+    plt.savefig(OUT_DIR / "q2_robustness_probability_curve.png", dpi=300)
+    plt.close()
+    return robust, robust_curve
+
+
 def profit_risk_analysis(candidate_df, n_scenarios=1500, seed=42):
     rng = np.random.default_rng(seed)
     price_factor = rng.triangular(0.85, 1.0, 1.15, n_scenarios)
@@ -889,7 +968,7 @@ def plot_profit_risk(risk_df):
     plt.savefig(OUT_DIR / "q3_profit_risk_pareto.png", dpi=300)
     plt.close()
 
-    top = risk_df.nlargest(12, "risk_adjusted_profit").copy()
+    top = risk_df.nlargest(10, "risk_adjusted_profit").copy()
     top["scheme"] = [f"S{i+1}" for i in range(len(top))]
     long = top.melt(
         id_vars=["scheme", "I", "W"],
@@ -897,12 +976,25 @@ def plot_profit_risk(risk_df):
         var_name="metric",
         value_name="value",
     )
-    plt.figure(figsize=(10, 5.6))
-    sns.barplot(data=long, x="scheme", y="value", hue="metric")
-    plt.xlabel("Top risk-adjusted schemes")
-    plt.ylabel("Profit / yuan per hour")
-    plt.title("Profit, Downside Quantile and Risk-Adjusted Profit")
-    plt.tight_layout()
+    fig, ax = plt.subplots(figsize=(10, 5.8))
+    sns.barplot(
+        data=long,
+        x="scheme",
+        y="value",
+        hue="metric",
+        palette=[JOURNAL["blue"], JOURNAL["sand"], JOURNAL["coral"]],
+        width=0.72,
+        ax=ax,
+    )
+    ymin = max(0, long["value"].min() - 700)
+    ymax = long["value"].max() + (long["value"].max() - ymin) * 0.5
+    ax.set_ylim(ymin, ymax)
+    ax.set_xlabel("Top risk-adjusted schemes")
+    ax.set_ylabel("Profit / yuan per hour")
+    ax.set_title("Profit, Downside Quantile and Risk-Adjusted Profit", loc="center")
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 0.98), ncol=3, frameon=False)
+    polish_axis(ax)
+    fig.tight_layout()
     plt.savefig(OUT_DIR / "q3_profit_risk_top_schemes.png", dpi=300)
     plt.close()
     return selected
@@ -919,6 +1011,20 @@ def plot_feasible_map(grid, selected):
         yticklabels=90,
     )
     ax.invert_yaxis()
+    xticks = ax.get_xticks()
+    xlabels = []
+    cols = pivot.columns.to_numpy()
+    for tick in xticks:
+        idx = int(round(tick))
+        xlabels.append(f"{cols[idx]:.3f}" if 0 <= idx < len(cols) else "")
+    ax.set_xticklabels(xlabels, rotation=0)
+    yticks = ax.get_yticks()
+    ylabels = []
+    rows = pivot.index.to_numpy()
+    for tick in yticks:
+        idx = int(round(tick))
+        ylabels.append(f"{rows[idx]:.3f}" if 0 <= idx < len(rows) else "")
+    ax.set_yticklabels(ylabels, rotation=0)
     plt.title("Predicted Yield Surface on I-W Grid")
     plt.xlabel("Excitation current I / A")
     plt.ylabel("Upward water flow W / mL/s")
@@ -958,7 +1064,7 @@ def rmse_score(y_true, y_pred):
 def plot_profit_sensitivity(econ_df, prefix="q3"):
     pivot = econ_df.pivot(index="electricity_factor", columns="price_factor", values="profit_yuan_h")
     plt.figure(figsize=(8, 5.8))
-    sns.heatmap(pivot, cmap="RdYlGn", annot=True, fmt=".0f", cbar_kws={"label": "Profit / yuan per hour"})
+    sns.heatmap(pivot, cmap=OCEAN_BREEZE_CMAP, annot=True, fmt=".0f", cbar_kws={"label": "Profit / yuan per hour"})
     plt.xlabel("Market price factor")
     plt.ylabel("Electricity price factor")
     plt.title("Problem 3 Dynamic Profit Sensitivity")
@@ -1039,7 +1145,7 @@ def plot_model_diagnostics(train_df, poly, rsm_models, rf_models):
 
     comp = pd.DataFrame(rows)
     plt.figure(figsize=(8, 5.2))
-    sns.barplot(data=comp, x="target", y="rmse", hue="model")
+    sns.barplot(data=comp, x="target", y="rmse", hue="model", palette=PAIR_PALETTE, width=0.58)
     plt.xlabel("Response variable")
     plt.ylabel("RMSE")
     plt.title("Prediction Error Comparison between RSM and Random Forest")
@@ -1059,7 +1165,7 @@ def plot_rf_importance(rf_metrics):
     )
     imp["variable"] = imp["variable"].map({"importance_I": "I", "importance_W": "W"})
     plt.figure(figsize=(8, 5.2))
-    sns.barplot(data=imp, x="target", y="importance", hue="variable")
+    sns.barplot(data=imp, x="target", y="importance", hue="variable", palette=PAIR_PALETTE, width=0.58)
     plt.xlabel("Response variable")
     plt.ylabel("Random forest feature importance")
     plt.title("Sensitivity Clue from Random Forest Feature Importance")
@@ -1184,7 +1290,7 @@ def main():
     plot_profit_sensitivity(econ_df, "q3")
     plot_profit_landscape(grid, econ_df)
     plot_strategy_phase(econ_df)
-    robustness_df, robustness_curve = plot_robustness(models, poly, selected, econ_df)
+    robustness_df, robustness_curve = plot_robustness_v2(models, poly, selected, econ_df)
     risk_candidates = pd.concat([pareto_scored, feasible.nlargest(120, "gamma")], ignore_index=True)
     risk_candidates = risk_candidates.drop_duplicates(subset=["I", "W"]).head(700)
     risk_df = profit_risk_analysis(risk_candidates)
