@@ -1,0 +1,1669 @@
+"""Docstring."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from math import atan2, degrees, erf, exp, isfinite, radians, sin, sqrt
+from pathlib import Path
+import re
+import sys
+import warnings
+
+import geopandas as gpd
+import networkx as nx
+import numpy as np
+import pandas as pd
+from pyproj import Geod
+
+
+BASE_DIR = Path(__file__).resolve().parent
+EARTH_ROTATION_RAD_S = 7.292e-5
+OUTER_PRESSURE_HPA = 1013.0
+BATTS_K = 6.72
+GEOD = Geod(ellps="WGS84")
+RAW_DIR = BASE_DIR / "data" / "raw"
+OUTPUT_DIR = BASE_DIR / "outputs"
+TIME_STEP_H = 3
+SIMULATION_MODE = "monte_carlo"
+MONTE_CARLO_SAMPLES = 200
+RANDOM_SEED = 42
+USE_CLIMADA_WINDFIELD = True
+SAVE_DEBUG_TABLES = False
+TOWER_DIRECTION_MODE = "fixed_45"
+SYNTHETIC_TOWER_SPACING_M = 400.0
+
+
+@dataclass
+class FragilityState:
+    """Docstring."""
+    """Docstring."""
+
+    name: str
+    median: float
+    beta: float
+    function_value: float
+
+
+# Table 1 in the paper gives log-median wind speeds. The values match km/h,
+# so they are converted to m/s here before Eq. (4) is evaluated.
+PLANT_SUBSTATION_FRAGILITY = [
+    FragilityState("complete", median=exp(5.523) / 3.6, beta=0.132, function_value=0.0),
+    FragilityState("severe", median=exp(5.204) / 3.6, beta=0.147, function_value=0.3),
+    FragilityState("moderate", median=exp(5.068) / 3.6, beta=0.136, function_value=0.6),
+]
+
+# Table 2 in the paper: directional tower-line fragility curves.
+# The table stores log-median wind speed in m/s.
+TOWER_DIRECTIONAL_FRAGILITY = {
+    0.0: (3.153, 0.053),
+    22.5: (3.261, 0.051),
+    45.0: (3.612, 0.052),
+    67.5: (3.665, 0.053),
+    90.0: (3.730, 0.062),
+}
+
+
+@dataclass
+class Node:
+    node_id: str
+    node_type: str
+    load: float = 0.0
+    generation: float = 0.0
+    function_state: float = 1.0
+
+
+@dataclass
+class Edge:
+    edge_id: str
+    from_id: str
+    to_id: str
+    length: float
+    power_capacity: float = 1.0
+    function_state: float = 1.0
+    has_spare: bool = False
+
+
+@dataclass
+class Metrics:
+    kte: float
+    ktr: float
+    klc: float
+    k: float
+
+
+class PowerNetwork:
+    """Docstring."""
+
+    def __init__(self) -> None:
+        self.nodes: dict[str, Node] = {}
+        self.edges: dict[str, Edge] = {}
+
+    def add_node(self, node: Node) -> None:
+        self.nodes[node.node_id] = node
+
+    def add_edge(self, edge: Edge) -> None:
+        self.edges[edge.edge_id] = edge
+
+    def copy(self) -> "PowerNetwork":
+        copied = PowerNetwork()
+        copied.nodes = {key: Node(**vars(value)) for key, value in self.nodes.items()}
+        copied.edges = {key: Edge(**vars(value)) for key, value in self.edges.items()}
+        return copied
+
+    def graph(self) -> nx.Graph:
+        graph = nx.Graph()
+        for node in self.nodes.values():
+            if node.function_state > 0:
+                graph.add_node(node.node_id)
+        for edge in self.edges.values():
+            if (edge.function_state > 0 or edge.has_spare) and edge.from_id in graph and edge.to_id in graph:
+                effective_function = max(edge.function_state, 1e-6)
+                graph.add_edge(edge.from_id, edge.to_id, weight=max(edge.length / effective_function, 1e-9))
+        return graph
+
+    def functional_metrics(
+        self,
+        baseline: Metrics | None = None,
+        lambdas: tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3),
+    ) -> Metrics:
+        graph = self.graph()
+        node_ids = list(self.nodes)
+        n = len(node_ids)
+
+        if n > 1:
+            total = 0.0
+            for source in node_ids:
+                lengths = nx.single_source_dijkstra_path_length(graph, source, weight="weight") if source in graph else {}
+                for target in node_ids:
+                    if source == target:
+                        continue
+                    distance = lengths.get(target, float("inf"))
+                    if isfinite(distance) and distance > 0:
+                        total += 1.0 / distance
+            kte = total / (n * (n - 1))
+
+        load_nodes = [node for node in self.nodes.values() if node.load > 0 or node.node_type in {"substation", "bus", "load"}]
+        plants = [node for node in self.nodes.values() if node.generation > 0 or node.node_type == "plant"]
+
+        for load_node in load_nodes:
+            connected = 0
+            for plant in plants:
+                if load_node.node_id in graph and plant.node_id in graph and nx.has_path(graph, plant.node_id, load_node.node_id):
+                    connected += 1
+            if plants:
+                reliabilities.append(connected / len(plants))
+        ktr = float(np.mean(reliabilities)) if reliabilities else 0.0
+
+        total_load = sum(max(node.load, 0.0) for node in load_nodes)
+        klc = 0.0
+        if total_load > 0 and plants and load_nodes:
+            flow_graph = nx.DiGraph()
+            source = "__source__"
+            sink = "__sink__"
+            for plant in plants:
+                if plant.node_id in graph:
+                    flow_graph.add_edge(source, plant.node_id, capacity=max(plant.generation * plant.function_state, 0.0))
+            for node in load_nodes:
+                if node.node_id in graph:
+                    flow_graph.add_edge(node.node_id, sink, capacity=max(node.load * node.function_state, 0.0))
+            for edge in self.edges.values():
+                if edge.from_id in graph and edge.to_id in graph and edge.function_state > 0:
+                    cap = max(edge.power_capacity * edge.function_state, 0.0)
+                    flow_graph.add_edge(edge.from_id, edge.to_id, capacity=cap)
+                    flow_graph.add_edge(edge.to_id, edge.from_id, capacity=cap)
+            try:
+                served_load = nx.maximum_flow_value(flow_graph, source, sink, capacity="capacity")
+                klc = served_load / total_load
+            except Exception:
+                klc = 0.0
+
+        if baseline is None:
+            k = lambdas[0] * kte + lambdas[1] * ktr + lambdas[2] * klc
+        else:
+            k = (
+                lambdas[0] * safe_ratio(kte, baseline.kte)
+                + lambdas[1] * safe_ratio(ktr, baseline.ktr)
+                + lambdas[2] * safe_ratio(klc, baseline.klc)
+            )
+        return Metrics(kte=kte, ktr=ktr, klc=klc, k=k)
+
+    def summary(self) -> dict[str, float]:
+        return {
+            "nodes": len(self.nodes),
+            "edges": len(self.edges),
+            "plants": sum(node.node_type == "plant" for node in self.nodes.values()),
+            "substations": sum(node.node_type == "substation" for node in self.nodes.values()),
+            "total_generation_mw": sum(node.generation for node in self.nodes.values()),
+            "total_load_proxy": sum(node.load for node in self.nodes.values()),
+        }
+
+
+def safe_ratio(value: float, baseline: float) -> float:
+    return value / baseline if abs(baseline) > 1e-12 else 0.0
+
+
+def compute_network_metrics_baseline(
+    network: PowerNetwork,
+    baseline: Metrics | None = None,
+    lambdas: tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3),
+) -> Metrics:
+    """Docstring."""
+
+    graph = network.graph()
+    plant_nodes = [node for node in network.nodes.values() if node.generation > 0 or node.node_type == "plant"]
+    load_nodes = [node for node in network.nodes.values() if node.load > 0 or node.node_type in {"substation", "bus", "load"}]
+    plant_ids = [node.node_id for node in plant_nodes]
+    load_ids = [node.node_id for node in load_nodes]
+
+    kte = 0.0
+    if plant_ids and load_ids:
+        inv_dist_sum = 0.0
+        for plant_id in plant_ids:
+            if plant_id not in graph:
+                continue
+            lengths = nx.single_source_dijkstra_path_length(graph, plant_id, weight="weight")
+            for load_id in load_ids:
+                distance = lengths.get(load_id, float("inf"))
+                if isfinite(distance) and distance > 0:
+                    inv_dist_sum += 1.0 / distance
+        kte = inv_dist_sum / (len(plant_ids) * len(load_ids))
+
+    ktr = 0.0
+    if plant_ids and load_ids:
+        components = list(nx.connected_components(graph))
+        node_to_comp: dict[str, int] = {}
+        for comp_idx, component in enumerate(components):
+            for node_id in component:
+                node_to_comp[node_id] = comp_idx
+        plant_labels = [node_to_comp.get(pid, -1) for pid in plant_ids]
+        ratios = []
+        for load_id in load_ids:
+            load_comp = node_to_comp.get(load_id, -1)
+            connected_plants = sum(label == load_comp and label != -1 for label in plant_labels)
+            ratios.append(connected_plants / len(plant_ids))
+        ktr = float(np.mean(ratios)) if ratios else 0.0
+
+    klc = 0.0
+    total_load = sum(max(node.load, 0.0) for node in load_nodes)
+    if plant_ids and load_ids and total_load > 0:
+        flow_graph = nx.DiGraph()
+        source = "__source__"
+        sink = "__sink__"
+        for plant in plant_nodes:
+            if plant.node_id in graph:
+                flow_graph.add_edge(source, plant.node_id, capacity=max(plant.generation * plant.function_state, 0.0))
+        for node in load_nodes:
+            if node.node_id in graph:
+                flow_graph.add_edge(node.node_id, sink, capacity=max(node.load * node.function_state, 0.0))
+        for edge in network.edges.values():
+            if edge.from_id in graph and edge.to_id in graph and edge.function_state > 0:
+                cap = max(edge.power_capacity * edge.function_state, 0.0)
+                flow_graph.add_edge(edge.from_id, edge.to_id, capacity=cap)
+                flow_graph.add_edge(edge.to_id, edge.from_id, capacity=cap)
+        try:
+            klc = nx.maximum_flow_value(flow_graph, source, sink, capacity="capacity") / total_load
+        except Exception:
+            klc = 0.0
+
+    if baseline is None:
+        k = lambdas[0] * kte + lambdas[1] * ktr + lambdas[2] * klc
+    else:
+        k = (
+            lambdas[0] * safe_ratio(kte, baseline.kte)
+            + lambdas[1] * safe_ratio(ktr, baseline.ktr)
+            + lambdas[2] * safe_ratio(klc, baseline.klc)
+        )
+    return Metrics(kte=kte, ktr=ktr, klc=klc, k=k)
+
+
+def radius_max_wind_m(center_pressure_hpa: float, outer_pressure_hpa: float = OUTER_PRESSURE_HPA) -> float:
+    """Docstring."""
+
+    pressure_diff = max(outer_pressure_hpa - center_pressure_hpa, 0.0)
+    return exp(-0.1239 * (sqrt(pressure_diff) ** 0.6003) + 5.1034) * 1000.0
+
+
+def max_wind_speed_ms(
+    center_pressure_hpa: float,
+    latitude_deg: float,
+    movement_speed_ms: float,
+    outer_pressure_hpa: float = OUTER_PRESSURE_HPA,
+) -> float:
+    """Docstring."""
+
+    r_max = radius_max_wind_m(center_pressure_hpa, outer_pressure_hpa)
+    pressure_diff = max(outer_pressure_hpa - center_pressure_hpa, 0.0)
+    coriolis = r_max * EARTH_ROTATION_RAD_S * sin(radians(latitude_deg))
+    vmax = 0.865 * (BATTS_K * sqrt(pressure_diff) - coriolis) + 0.5 * movement_speed_ms
+    return max(vmax, 0.0)
+
+
+def wind_speed_at_height_ms(
+    distance_to_center_m: float,
+    height_m: float,
+    center_pressure_hpa: float,
+    latitude_deg: float,
+    movement_speed_ms: float,
+    max_wind_ms: float | None = None,
+    gradient_height_m: float = 500.0,
+    roughness_index: float = 0.18,
+) -> float:
+    """Docstring."""
+
+    r = max(distance_to_center_m, 1.0)
+    r_max = radius_max_wind_m(center_pressure_hpa)
+    if max_wind_ms is None or pd.isna(max_wind_ms) or max_wind_ms <= 0:
+        vmax = max_wind_speed_ms(center_pressure_hpa, latitude_deg, movement_speed_ms)
+    else:
+        vmax = max_wind_ms
+    vertical_factor = (height_m / gradient_height_m) ** roughness_index
+    radial_factor = r / r_max if r <= r_max else (r_max / r) ** 0.7
+    return vmax * radial_factor * vertical_factor
+
+
+def fragility_probability(intensity: float, median: float, beta: float) -> float:
+    """Docstring."""
+
+    x = max(float(intensity), 1e-12)
+    z = np.log(x / median) / beta
+    return 0.5 * (1.0 + erf(z / sqrt(2.0)))
+
+
+def fragility_probability_log_median(intensity: float, log_median: float, beta: float) -> float:
+    """Docstring."""
+
+    x = max(float(intensity), 1e-12)
+    z = (np.log(x) - log_median) / beta
+    return 0.5 * (1.0 + erf(z / sqrt(2.0)))
+
+
+def expected_component_function(intensity: float, states: list[FragilityState], intact_value: float = 1.0) -> float:
+    """Docstring."""
+
+    exceed = np.array([fragility_probability(intensity, s.median, s.beta) for s in states])
+    exceed = np.maximum.accumulate(exceed)
+    probabilities = [exceed[0]]
+    for i in range(len(exceed) - 1):
+        probabilities.append(max(exceed[i + 1] - exceed[i], 0.0))
+    probabilities.append(max(1.0 - exceed[-1], 0.0))
+    probabilities = np.array(probabilities) / max(sum(probabilities), 1e-12)
+    values = np.array([s.function_value for s in states] + [intact_value])
+    return float(np.dot(probabilities, values))
+
+
+def station_binary_failure_probability(intensity: float) -> float:
+    p_complete = fragility_probability(intensity, PLANT_SUBSTATION_FRAGILITY[0].median, PLANT_SUBSTATION_FRAGILITY[0].beta)
+    p_severe = fragility_probability(intensity, PLANT_SUBSTATION_FRAGILITY[1].median, PLANT_SUBSTATION_FRAGILITY[1].beta)
+    p_moderate = fragility_probability(intensity, PLANT_SUBSTATION_FRAGILITY[2].median, PLANT_SUBSTATION_FRAGILITY[2].beta)
+    p_moderate = max(p_moderate, p_severe, p_complete)
+    p_severe = min(max(p_severe, p_complete), p_moderate)
+    p_complete = min(p_complete, p_severe)
+    p_fail = (p_moderate - p_severe) * 0.4 + (p_severe - p_complete) * 0.7 + p_complete
+    return float(np.clip(p_fail, 0.0, 1.0))
+
+
+def distance_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    _, _, distance = GEOD.inv(lon1, lat1, lon2, lat2)
+    return float(distance)
+
+
+def bearing_deg(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    azimuth, _, _ = GEOD.inv(lon1, lat1, lon2, lat2)
+    return float(azimuth % 360.0)
+
+
+def folded_angle_0_90(angle_a: float, angle_b: float) -> float:
+    diff = abs((angle_a - angle_b + 180.0) % 360.0 - 180.0)
+    return min(diff, 180.0 - diff)
+
+
+def nearest_direction_bin(angle: float) -> float:
+    if TOWER_DIRECTION_MODE == "fixed_45":
+        return 45.0
+    bins = np.asarray(sorted(TOWER_DIRECTIONAL_FRAGILITY), dtype=float)
+    return float(bins[np.argmin(np.abs(bins - angle))])
+
+
+def tower_failure_probability(wind_speed_ms: float, relative_wind_direction_deg: float) -> float:
+    direction = nearest_direction_bin(relative_wind_direction_deg)
+    log_median, beta = TOWER_DIRECTIONAL_FRAGILITY[direction]
+    return fragility_probability_log_median(wind_speed_ms, log_median, beta)
+
+
+def damage_level_from_count(count: float, eps: float = 1e-2) -> str:
+    """Docstring."""
+
+    if count <= eps:
+        return "normal"
+    if count < 3:
+        return "slight"
+    return "severe"
+
+
+def compute_wind_time_series(track: pd.DataFrame, exposure_points: pd.DataFrame) -> pd.DataFrame:
+    """Docstring."""
+
+    rows = []
+    for _, point in track.iterrows():
+        row = {"time": point["time"]}
+        for _, asset in exposure_points.iterrows():
+            d = distance_m(point["lon"], point["lat"], asset["lon"], asset["lat"])
+            row[str(asset["id"])] = wind_speed_at_height_ms(
+                distance_to_center_m=d,
+                height_m=float(asset.get("height_m", 44.0)),
+                center_pressure_hpa=float(point["center_pressure_hpa"]),
+                latitude_deg=float(point["lat"]),
+                movement_speed_ms=float(point.get("movement_speed_ms", 0.0)),
+                max_wind_ms=point.get("max_wind_speed_ms", None),
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def read_zhuhai_assets() -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, pd.DataFrame]:
+    """Docstring."""
+
+    plant_files = [
+        ("wind", "plant_wind.shp"),
+        ("solar", "plant_solar.shp"),
+        ("bio", "plant_bio.shp"),
+        ("oilgas", "plant_oilgas.shp"),
+        ("coal", "plant_coal.shp"),
+    ]
+    plants = []
+    for plant_type, file_name in plant_files:
+        gdf = gpd.read_file(RAW_DIR / file_name).to_crs("EPSG:4326")
+        gdf["plant_type"] = plant_type
+        plants.append(gdf)
+    plants_gdf = pd.concat(plants, ignore_index=True)
+    plants_gdf = gpd.GeoDataFrame(plants_gdf, geometry="geometry", crs="EPSG:4326")
+
+    substations = gpd.read_file(RAW_DIR / "substations.shp").to_crs("EPSG:4326")
+    towers = gpd.read_file(RAW_DIR / "towers.shp").to_crs("EPSG:4326")
+    lines = gpd.read_file(RAW_DIR / "lines.shp").to_crs("EPSG:4326")
+    manual = pd.read_excel(RAW_DIR / "manual_network.xlsx", sheet_name="Sheet1")
+    return plants_gdf, substations, towers, lines, manual
+
+
+def get_capacity(row: pd.Series) -> float:
+    value = row.get("Capacity__", 0.0)
+    try:
+        return float(value) if pd.notna(value) else 0.0
+    except Exception:
+        return 0.0
+
+
+def build_zhuhai_network() -> tuple[PowerNetwork, pd.DataFrame, pd.DataFrame]:
+    """Docstring."""
+
+    plants, substations, towers, lines, manual = read_zhuhai_assets()
+    network = PowerNetwork()
+    node_rows = []
+
+    for _, row in plants.iterrows():
+        node_id = str(row["ID"])
+        capacity = get_capacity(row)
+        lon = float(row.geometry.x)
+        lat = float(row.geometry.y)
+        network.add_node(Node(node_id, "plant", generation=capacity))
+        node_rows.append({"id": node_id, "type": "plant", "lon": lon, "lat": lat, "generation": capacity, "load": 0.0})
+
+        node_id = f"S{idx}"
+        lon = float(row.geometry.x)
+        lat = float(row.geometry.y)
+        voltage = row.get("voltage_1", row.get("voltage", 0))
+        load_proxy = float(voltage) / 1000.0 if pd.notna(voltage) else 1.0
+        network.add_node(Node(node_id, "substation", load=load_proxy))
+        node_rows.append({"id": node_id, "type": "substation", "lon": lon, "lat": lat, "generation": 0.0, "load": load_proxy})
+
+    node_df = pd.DataFrame(node_rows)
+    node_xy = {row["id"]: (row["lon"], row["lat"]) for _, row in node_df.iterrows()}
+    edge_rows = []
+    tower_col = manual.columns[7]
+    tower_id_col = towers.columns[0]
+    tower_to_line = {
+        f"T{int(row[tower_id_col])}": int(row["FID_PowerT"])
+        for _, row in towers.iterrows()
+        if pd.notna(row.get("FID_PowerT"))
+    }
+    line_lengths = {int(row["FID_PowerT"]): float(row["aplength"]) for _, row in lines.iterrows()}
+    for idx, row in manual.iterrows():
+        source = str(row["source"])
+        target = str(row["target"])
+        if source not in network.nodes or target not in network.nodes:
+            continue
+        sx, sy = node_xy[source]
+        tx, ty = node_xy[target]
+        length = distance_m(sx, sy, tx, ty)
+        edge_id = f"L{idx}"
+        network.add_edge(Edge(edge_id, source, target, length))
+        tower_text = "" if pd.isna(row.get(tower_col)) else str(row.get(tower_col))
+        tower_ids = re.findall(r"T\d+", tower_text)
+        line_fids = [tower_to_line[tower_id] for tower_id in tower_ids if tower_id in tower_to_line]
+        line_fid = max(set(line_fids), key=line_fids.count) if line_fids else np.nan
+        if pd.notna(line_fid) and line_fid in line_lengths:
+            length = line_lengths[int(line_fid)]
+            network.edges[edge_id].length = length
+        edge_rows.append(
+            {
+                "edge_id": edge_id,
+                "source": source,
+                "target": target,
+                "length_m": length,
+                "voltage_kv": row.get("line voltage(kv)", np.nan),
+                "tower_count": len(tower_ids),
+                "tower_ids": ",".join(tower_ids),
+                "line_fid": line_fid,
+            }
+        )
+
+    edge_df = pd.DataFrame(edge_rows)
+    return network, node_df, edge_df
+
+
+def build_tower_exposure(towers: gpd.GeoDataFrame) -> pd.DataFrame:
+    """Docstring."""
+
+    tower_id_col = towers.columns[0]
+    exposure = pd.DataFrame(
+        {
+            "id": "T" + towers[tower_id_col].astype(int).astype(str),
+            "lon": towers.geometry.x.astype(float),
+            "lat": towers.geometry.y.astype(float),
+            "height_m": 44.0,
+        }
+    )
+    return exposure.drop_duplicates(subset=["id"]).reset_index(drop=True)
+
+
+def build_synthetic_tower_exposure(
+    edges: pd.DataFrame,
+    nodes: pd.DataFrame,
+    line_geometries: dict[int, object],
+) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
+    """Docstring."""
+
+    from shapely.geometry import LineString, Point
+    from shapely.ops import transform
+    from pyproj import Transformer
+
+    edges_out = edges.copy().reset_index(drop=True)
+    nodes_xy = {str(row["id"]): (float(row["lon"]), float(row["lat"])) for _, row in nodes.iterrows()}
+    forward = Transformer.from_crs("EPSG:4326", "EPSG:32649", always_xy=True)
+    backward = Transformer.from_crs("EPSG:32649", "EPSG:4326", always_xy=True)
+
+    tower_records = []
+    tower_counter = 1
+
+    def line_for_edge(row: pd.Series) -> LineString:
+        line_fid = row.get("line_fid", np.nan)
+        if pd.notna(line_fid):
+            geom = line_geometries.get(int(line_fid))
+            if geom is not None and not geom.is_empty:
+                if geom.geom_type == "MultiLineString":
+                    geom = max(list(geom.geoms), key=lambda g: g.length)
+                if geom.geom_type == "LineString":
+                    return geom
+        source = str(row["source"])
+        target = str(row["target"])
+        if source in nodes_xy and target in nodes_xy:
+            sx, sy = nodes_xy[source]
+            tx, ty = nodes_xy[target]
+            return LineString([(sx, sy), (tx, ty)])
+        return LineString([])
+
+    for edge_idx, edge in edges_out.iterrows():
+        geom = line_for_edge(edge)
+        if geom.is_empty:
+            edges_out.at[edge_idx, "tower_ids"] = ""
+            edges_out.at[edge_idx, "tower_count"] = 0
+            continue
+
+        geom_m = transform(forward.transform, geom)
+        length_m = float(geom_m.length)
+        if not np.isfinite(length_m) or length_m <= 0:
+            edges_out.at[edge_idx, "tower_ids"] = ""
+            edges_out.at[edge_idx, "tower_count"] = 0
+            continue
+
+        tower_distances = list(np.arange(SYNTHETIC_TOWER_SPACING_M, length_m, SYNTHETIC_TOWER_SPACING_M))
+        if len(tower_distances) == 0:
+            tower_distances = [length_m / 2.0]
+
+        tower_ids = []
+        for seq, dist_m in enumerate(tower_distances, start=1):
+            point_m = geom_m.interpolate(dist_m)
+            point_wgs84 = transform(backward.transform, point_m)
+            tower_id = f"T{tower_counter}"
+            tower_counter += 1
+            tower_ids.append(tower_id)
+            tower_records.append(
+                {
+                    "id": tower_id,
+                    "lon": float(point_wgs84.x),
+                    "lat": float(point_wgs84.y),
+                    "edge_id": str(edge["edge_id"]),
+                    "line_fid": edge.get("line_fid", np.nan),
+                    "sequence": seq,
+                    "distance_m": float(dist_m),
+                    "height_m": 44.0,
+                }
+            )
+
+        edges_out.at[edge_idx, "tower_ids"] = ",".join(tower_ids)
+        edges_out.at[edge_idx, "tower_count"] = len(tower_ids)
+        edges_out.at[edge_idx, "synthetic_tower_spacing_m"] = SYNTHETIC_TOWER_SPACING_M
+
+    tower_df = pd.DataFrame(tower_records)
+    tower_gdf = gpd.GeoDataFrame(
+        tower_df,
+        geometry=gpd.points_from_xy(tower_df["lon"], tower_df["lat"]),
+        crs="EPSG:4326",
+    ) if len(tower_df) > 0 else gpd.GeoDataFrame(
+        tower_df,
+        geometry=gpd.GeoSeries([], crs="EPSG:4326"),
+        crs="EPSG:4326",
+    )
+    return tower_gdf, edges_out
+
+
+def build_zhuhai_network_mc() -> tuple[PowerNetwork, pd.DataFrame, pd.DataFrame, dict[int, object]]:
+    """Docstring."""
+
+    plants, substations, towers, lines, manual = read_zhuhai_assets()
+    network = PowerNetwork()
+    node_rows = []
+    plant_points: list[tuple[str, float, float, float]] = []
+    plant_capacities: list[float] = []
+
+    for _, row in plants.iterrows():
+        node_id = str(row["ID"])
+        capacity = get_capacity(row)
+        lon = float(row.geometry.x)
+        lat = float(row.geometry.y)
+        plant_points.append((node_id, lon, lat, capacity))
+        plant_capacities.append(capacity)
+        network.add_node(Node(node_id, "plant", generation=capacity))
+        node_rows.append(
+            {
+                "id": node_id,
+                "type": "plant",
+                "lon": lon,
+                "lat": lat,
+                "generation": capacity,
+                "load": 0.0,
+                "capacity_proxy": capacity,
+            }
+        )
+
+    for idx, row in substations.reset_index(drop=True).iterrows():
+        node_id = f"S{idx}"
+        lon = float(row.geometry.x)
+        lat = float(row.geometry.y)
+        if plant_points:
+            nearest_capacity = min(
+                plant_points,
+                key=lambda item: distance_m(lon, lat, item[1], item[2]),
+            )[3]
+        else:
+            nearest_capacity = float(np.mean(plant_capacities)) if plant_capacities else 1.0
+        load_proxy = float(nearest_capacity if nearest_capacity > 0 else 1.0)
+        network.add_node(Node(node_id, "substation", load=load_proxy))
+        node_rows.append(
+            {
+                "id": node_id,
+                "type": "substation",
+                "lon": lon,
+                "lat": lat,
+                "generation": 0.0,
+                "load": load_proxy,
+                "capacity_proxy": load_proxy,
+            }
+        )
+
+    node_df = pd.DataFrame(node_rows)
+    node_xy = {row["id"]: (row["lon"], row["lat"]) for _, row in node_df.iterrows()}
+    capacity_proxy = {row["id"]: float(row.get("capacity_proxy", 1.0)) for _, row in node_df.iterrows()}
+
+    tower_col = manual.columns[7]
+    tower_id_col = towers.columns[0]
+    tower_to_line = {
+        f"T{int(row[tower_id_col])}": int(row["FID_PowerT"])
+        for _, row in towers.iterrows()
+        if pd.notna(row.get("FID_PowerT"))
+    }
+    line_lengths = {int(row["FID_PowerT"]): float(row["aplength"]) for _, row in lines.iterrows()}
+    edge_rows = []
+
+    for idx, row in manual.iterrows():
+        source = str(row["source"])
+        target = str(row["target"])
+        if source not in network.nodes or target not in network.nodes:
+            continue
+        sx, sy = node_xy[source]
+        tx, ty = node_xy[target]
+        length = distance_m(sx, sy, tx, ty)
+        edge_id = f"L{idx}"
+        edge_power_capacity = max(min(capacity_proxy.get(source, 1.0), capacity_proxy.get(target, 1.0)), 1.0)
+        network.add_edge(Edge(edge_id, source, target, length, power_capacity=edge_power_capacity))
+
+        tower_text = "" if pd.isna(row.get(tower_col)) else str(row.get(tower_col))
+        tower_ids = re.findall(r"T\d+", tower_text)
+        line_fids = [tower_to_line[tower_id] for tower_id in tower_ids if tower_id in tower_to_line]
+        line_fid = max(set(line_fids), key=line_fids.count) if line_fids else np.nan
+        if pd.notna(line_fid) and int(line_fid) in line_lengths:
+            length = line_lengths[int(line_fid)]
+            network.edges[edge_id].length = length
+
+        edge_rows.append(
+            {
+                "edge_id": edge_id,
+                "source": source,
+                "target": target,
+                "length_m": length,
+                "voltage_kv": row.get("line voltage(kv)", np.nan),
+                "power_capacity": edge_power_capacity,
+                "tower_count": len(tower_ids),
+                "tower_ids": ",".join(tower_ids),
+                "line_fid": line_fid,
+            }
+        )
+
+    edge_df = pd.DataFrame(edge_rows)
+    line_geometries = {
+        int(row["FID_PowerT"]): row.geometry
+        for _, row in lines.iterrows()
+        if pd.notna(row.get("FID_PowerT"))
+    }
+    return network, node_df, edge_df, line_geometries
+
+
+def parse_tower_ids(value: object) -> list[str]:
+    if pd.isna(value):
+        return []
+    return re.findall(r"T\d+", str(value))
+
+
+def edge_bearing(edge: pd.Series, xy: dict[str, tuple[float, float]]) -> float:
+    source = edge["source"]
+    target = edge["target"]
+    if source in xy and target in xy:
+        sx, sy = xy[source]
+        tx, ty = xy[target]
+        return bearing_deg(sx, sy, tx, ty)
+    return 0.0
+
+
+def read_hato_track() -> pd.DataFrame:
+    """Docstring."""
+
+    gdf = gpd.read_file(r"C:/Users/86151/Documents/ArcGIS/Default.gdb", layer="Export_Output_2")
+    df = pd.DataFrame(gdf.drop(columns="geometry"))
+    df["time"] = pd.to_datetime(df["ISO_TIME"])
+    df["lon"] = pd.to_numeric(df["LON"], errors="coerce")
+    df["lat"] = pd.to_numeric(df["LAT"], errors="coerce")
+
+    pressure = pd.to_numeric(df["WMO_PRES"], errors="coerce")
+    for col in ["CMA_PRES", "TOK_PRES", "USA_PRES"]:
+        pressure = pressure.mask((pressure <= 0) | pressure.isna(), pd.to_numeric(df[col], errors="coerce"))
+    df["center_pressure_hpa"] = pressure.mask(pressure <= 0).ffill().bfill()
+
+    df["movement_speed_ms"] = pd.to_numeric(df["STORM_SPD"], errors="coerce").fillna(0.0) * 0.514444
+    wind = pd.to_numeric(df["WMO_WIND"], errors="coerce")
+    for col in ["CMA_WIND", "TOK_WIND", "USA_WIND"]:
+        wind = wind.mask((wind <= 0) | wind.isna(), pd.to_numeric(df[col], errors="coerce"))
+    df["max_wind_speed_ms"] = wind.mask(wind <= 0) * 0.514444
+    rmw = pd.to_numeric(df.get("USA_RMW", np.nan), errors="coerce")
+    df["radius_max_wind_nm"] = rmw.mask(rmw <= 0).fillna(30.0)
+    return df[
+        [
+            "time",
+            "lon",
+            "lat",
+            "center_pressure_hpa",
+            "movement_speed_ms",
+            "max_wind_speed_ms",
+            "radius_max_wind_nm",
+        ]
+    ].dropna(subset=["lon", "lat"])
+
+
+def resample_track_to_step(track: pd.DataFrame, step_hours: int = 3) -> pd.DataFrame:
+    """Docstring."""
+
+    if track.empty or len(track) < 2:
+        return track.copy()
+
+    work = track.sort_values("time").copy().set_index("time")
+    freq = f"{int(step_hours)}h"
+    full_index = pd.date_range(work.index.min(), work.index.max(), freq=freq)
+    numeric_cols = [
+        col
+        for col in ["lon", "lat", "center_pressure_hpa", "movement_speed_ms", "max_wind_speed_ms", "radius_max_wind_nm"]
+        if col in work.columns
+    ]
+    work = work.reindex(work.index.union(full_index)).sort_index()
+    if numeric_cols:
+        work[numeric_cols] = work[numeric_cols].interpolate(method="time").ffill().bfill()
+    work = work.loc[full_index].reset_index().rename(columns={"index": "time"})
+    return work[track.columns]
+
+
+def safe_to_csv(df: pd.DataFrame, path: Path) -> Path:
+    """Docstring."""
+
+    try:
+        df.to_csv(path, index=False, encoding="utf-8-sig")
+        return path
+    except PermissionError:
+        fallback = path.with_name(f"{path.stem}_updated{path.suffix}")
+        df.to_csv(fallback, index=False, encoding="utf-8-sig")
+        print(f"Warning: {path} is locked. Wrote {fallback} instead.")
+        return fallback
+
+
+def clean_non_key_outputs() -> None:
+    """Docstring."""
+
+    keep = {
+        "climada_node_wind_timeseries.csv",
+        "climada_tower_wind_timeseries.csv",
+        "zhuhai_hato_failure_timeline.csv",
+        "zhuhai_network_edges.csv",
+        "wind_diagnosis.csv",
+        "zhuhai_network_map.png",
+        "zhuhai_function_timeline.png",
+        "zhuhai_wind_timeline.png",
+    }
+    if SAVE_DEBUG_TABLES:
+        keep.add("tower_failure_details.csv")
+    for path in OUTPUT_DIR.glob("*"):
+        if path.name not in keep:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def make_climada_processed_track_csv(track: pd.DataFrame) -> Path:
+    """Docstring."""
+
+    path = OUTPUT_DIR / "_climada_hato_processed_track.csv"
+    vmax_kn = track["max_wind_speed_ms"].copy() / 0.514444
+    fallback_vmax = track.apply(
+        lambda row: max_wind_speed_ms(
+            float(row["center_pressure_hpa"]),
+            float(row["lat"]),
+            float(row.get("movement_speed_ms", 0.0)),
+        )
+        / 0.514444,
+        axis=1,
+    )
+    vmax_kn = vmax_kn.mask(vmax_kn <= 0).fillna(fallback_vmax)
+    processed = pd.DataFrame(
+        {
+            "ibtracsID": "2017232N19130",
+            "isotime": track["time"].dt.strftime("%Y%m%d%H").astype(int),
+            "cgps_lat": track["lat"],
+            "cgps_lon": track["lon"],
+            "pcen": track["center_pressure_hpa"],
+            "vmax": vmax_kn,
+            "tint": 3,
+            "rmax": track.get("radius_max_wind_nm", pd.Series(30.0, index=track.index)).fillna(30.0),
+            "penv": OUTER_PRESSURE_HPA,
+            "gen_basin": "WP",
+            "original_data": True,
+            "data_provider": "codex",
+        }
+    )
+    processed.to_csv(path, index=False)
+    return path
+
+
+def run_climada_windfield(
+    track: pd.DataFrame,
+    node_exposure: pd.DataFrame,
+    tower_exposure: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, bool]:
+    """Docstring."""
+
+    if not USE_CLIMADA_WINDFIELD:
+        node_wind = compute_wind_time_series(track, node_exposure)
+        tower_wind = compute_wind_time_series(track, tower_exposure)
+        return node_wind, tower_wind, False
+
+    try:
+        from climada.hazard import Centroids, TCTracks, TropCyclone
+
+        processed_path = make_climada_processed_track_csv(track)
+        tc_tracks = TCTracks.from_processed_ibtracs_csv(str(processed_path))
+        if not SAVE_DEBUG_TABLES:
+            try:
+                processed_path.unlink()
+            except OSError:
+                pass
+        all_exposure = pd.concat(
+            [
+                node_exposure[["id", "lon", "lat"]],
+                tower_exposure[["id", "lon", "lat"]],
+            ],
+            ignore_index=True,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            centroids = Centroids.from_lat_lon(all_exposure["lat"].to_numpy(), all_exposure["lon"].to_numpy())
+        hazard = TropCyclone.from_tracks(
+            tc_tracks,
+            centroids=centroids,
+            store_windfields=True,
+            intensity_thres=0,
+            max_dist_eye_km=1000,
+            ignore_distance_to_coast=True,
+        )
+        wind_vectors = hazard.windfields[0].toarray()
+        wind_speed = np.sqrt(wind_vectors[:, 0::2] ** 2 + wind_vectors[:, 1::2] ** 2)
+        wind_df = pd.DataFrame(wind_speed, columns=all_exposure["id"].astype(str))
+        wind_df.insert(0, "time", track["time"].to_numpy())
+
+        node_ids = node_exposure["id"].astype(str).tolist()
+        tower_ids = tower_exposure["id"].astype(str).tolist()
+        node_wind = wind_df[["time"] + node_ids].copy()
+        tower_wind = wind_df[["time"] + tower_ids].copy()
+        return node_wind, tower_wind, True
+    except Exception as exc:
+        print(f"CLIMADA windfield failed, fallback to internal wind field: {exc}")
+        node_wind = compute_wind_time_series(track, node_exposure)
+        tower_wind = compute_wind_time_series(track, tower_exposure)
+        return node_wind, tower_wind, False
+
+
+def write_wind_diagnosis(
+    track: pd.DataFrame,
+    nodes: pd.DataFrame,
+    towers: pd.DataFrame,
+    node_wind: pd.DataFrame,
+    tower_wind: pd.DataFrame,
+) -> None:
+    """Docstring."""
+
+    pressure_vmax = track.apply(
+        lambda row: max_wind_speed_ms(
+            float(row["center_pressure_hpa"]),
+            float(row["lat"]),
+            float(row.get("movement_speed_ms", 0.0)),
+        ),
+        axis=1,
+    )
+
+    def min_track_distance(exposure: pd.DataFrame) -> float:
+        best = float("inf")
+        for _, point in track.iterrows():
+            for _, asset in exposure.iterrows():
+                best = min(best, distance_m(point["lon"], point["lat"], asset["lon"], asset["lat"]))
+        return best
+
+    node_values = node_wind.drop(columns=["time"], errors="ignore")
+    tower_values = tower_wind.drop(columns=["time"], errors="ignore")
+    node_max = float(node_values.max().max()) if not node_values.empty else 0.0
+    tower_max = float(tower_values.max().max()) if not tower_values.empty else 0.0
+    diagnosis = pd.DataFrame(
+        [
+            {
+                "max_track_wind_ms": float(track["max_wind_speed_ms"].max(skipna=True)),
+                "min_center_pressure_hpa": float(track["center_pressure_hpa"].min()),
+                "max_node_wind_ms": node_max,
+                "max_tower_wind_ms": tower_max,
+                "nearest_track_to_node_m": min_track_distance(nodes[["id", "lon", "lat"]]),
+                "nearest_track_to_tower_m": min_track_distance(towers[["id", "lon", "lat"]]),
+            }
+        ]
+    )
+    safe_to_csv(diagnosis, OUTPUT_DIR / "wind_diagnosis.csv")
+
+
+def compute_edge_function_from_towers(
+    edge: pd.Series,
+    tower_row: pd.Series,
+    tower_exposure: pd.DataFrame,
+    track_point: pd.Series,
+    line_bearing: float,
+) -> tuple[float, float, float, np.ndarray, list[dict[str, object]]]:
+    """Docstring."""
+
+    tower_ids = [tower_id for tower_id in parse_tower_ids(edge.get("tower_ids")) if tower_id in tower_row.index]
+    if not tower_ids:
+        return np.nan, np.nan, np.nan, np.asarray([]), []
+
+    tower_xy = tower_exposure.set_index("id")[["lon", "lat"]]
+    edge_id = edge.get("edge_id", edge.name)
+    failure_probs = []
+    detail_rows = []
+    for tower_id in tower_ids:
+        wind_speed = float(tower_row[tower_id])
+        tower_lon = float(tower_xy.loc[tower_id, "lon"])
+        tower_lat = float(tower_xy.loc[tower_id, "lat"])
+        radial_bearing = bearing_deg(float(track_point["lon"]), float(track_point["lat"]), tower_lon, tower_lat)
+        local_wind_direction = (radial_bearing + 90.0) % 360.0
+        relative_direction = folded_angle_0_90(local_wind_direction, line_bearing)
+        direction_bin = nearest_direction_bin(relative_direction)
+        selected_mu, selected_beta = TOWER_DIRECTIONAL_FRAGILITY[direction_bin]
+        failure_probability = fragility_probability_log_median(wind_speed, selected_mu, selected_beta)
+        failure_probs.append(failure_probability)
+        detail_rows.append(
+            {
+                "time": track_point["time"],
+                "edge_id": edge_id,
+                "tower_id": tower_id,
+                "tower_wind_ms": wind_speed,
+                "line_bearing": line_bearing,
+                "local_wind_direction": local_wind_direction,
+                "relative_direction": relative_direction,
+                "direction_bin": direction_bin,
+                "selected_mu": selected_mu,
+                "selected_beta": selected_beta,
+                "tower_failure_probability": failure_probability,
+            }
+        )
+
+    probabilities = np.asarray(failure_probs, dtype=float)
+    line_survival_probability = float(np.prod(1.0 - probabilities))
+    expected_failed_towers = float(probabilities.sum())
+    max_tower_failure_probability = float(probabilities.max())
+    return line_survival_probability, expected_failed_towers, max_tower_failure_probability, probabilities, detail_rows
+
+
+def simulate_zhuhai_hato() -> None:
+    """Docstring."""
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    clean_non_key_outputs()
+    network, nodes, edges = build_zhuhai_network()
+    _, _, towers, _, _ = read_zhuhai_assets()
+    baseline = network.functional_metrics()
+    track = read_hato_track()
+
+    exposure = nodes[["id", "lon", "lat"]].copy()
+    exposure["height_m"] = 44.0
+    tower_exposure = build_tower_exposure(towers)
+    wind_matrix, tower_wind_matrix, climada_used = run_climada_windfield(track, exposure, tower_exposure)
+    safe_to_csv(wind_matrix, OUTPUT_DIR / "climada_node_wind_timeseries.csv")
+    safe_to_csv(tower_wind_matrix, OUTPUT_DIR / "climada_tower_wind_timeseries.csv")
+    write_wind_diagnosis(track, nodes, tower_exposure, wind_matrix, tower_wind_matrix)
+
+    cumulative = wind_matrix.drop(columns=["time"]).cummax()
+    tower_cumulative = tower_wind_matrix.drop(columns=["time"]).cummax()
+    timeline_rows = []
+    cumulative_edge_functions = {edge_id: 1.0 for edge_id in edges["edge_id"]}
+    cumulative_expected_failed_towers = {edge_id: 0.0 for edge_id in edges["edge_id"]}
+    cumulative_max_tower_failure_probability = {edge_id: 0.0 for edge_id in edges["edge_id"]}
+    cumulative_mc_mean_damaged = {edge_id: 0.0 for edge_id in edges["edge_id"]}
+    cumulative_mc_slight_probability = {edge_id: 0.0 for edge_id in edges["edge_id"]}
+    cumulative_mc_severe_probability = {edge_id: 0.0 for edge_id in edges["edge_id"]}
+    failure_times = {}
+    tower_failure_detail_rows = []
+    rng = np.random.default_rng(RANDOM_SEED)
+    edge_lookup = edges.set_index("edge_id")
+    node_xy = {node["id"]: (node["lon"], node["lat"]) for _, node in nodes.iterrows()}
+    for i, row in cumulative.iterrows():
+        tower_row = tower_cumulative.iloc[i]
+        track_point = track.iloc[i]
+        damaged_network = network.copy()
+        for node_id in nodes["id"]:
+            intensity = float(row[node_id])
+            damaged_network.nodes[node_id].function_state = expected_component_function(intensity, PLANT_SUBSTATION_FRAGILITY)
+
+        damaged_edge_count = 0
+        for edge in damaged_network.edges.values():
+            edge_meta = edge_lookup.loc[edge.edge_id]
+            line_bearing = edge_bearing(edge_meta, node_xy)
+            edge_function, expected_failed, max_pf, tower_probabilities, detail_rows = compute_edge_function_from_towers(
+                edge_meta,
+                tower_row,
+                tower_exposure,
+                track_point,
+                line_bearing,
+            )
+            tower_failure_detail_rows.extend(detail_rows)
+            if pd.isna(edge_function):
+                edge_function = 1.0
+                expected_failed = 0.0
+                max_pf = 0.0
+                tower_probabilities = np.asarray([])
+
+            if SIMULATION_MODE == "monte_carlo" and len(tower_probabilities) > 0:
+                samples = rng.random((MONTE_CARLO_SAMPLES, len(tower_probabilities))) < tower_probabilities
+                damaged_counts = samples.sum(axis=1)
+                mean_damaged = float(damaged_counts.mean())
+                slight_probability = float(((damaged_counts > 0) & (damaged_counts < 3)).mean())
+                severe_probability = float((damaged_counts >= 3).mean())
+                edge_function = float((damaged_counts == 0).mean() + 0.8 * slight_probability)
+                cumulative_mc_mean_damaged[edge.edge_id] = max(cumulative_mc_mean_damaged[edge.edge_id], mean_damaged)
+                cumulative_mc_slight_probability[edge.edge_id] = max(cumulative_mc_slight_probability[edge.edge_id], slight_probability)
+                cumulative_mc_severe_probability[edge.edge_id] = max(cumulative_mc_severe_probability[edge.edge_id], severe_probability)
+
+            cumulative_edge_functions[edge.edge_id] = min(cumulative_edge_functions[edge.edge_id], edge_function)
+            cumulative_expected_failed_towers[edge.edge_id] = max(cumulative_expected_failed_towers[edge.edge_id], expected_failed)
+            cumulative_max_tower_failure_probability[edge.edge_id] = max(cumulative_max_tower_failure_probability[edge.edge_id], max_pf)
+            edge.function_state = cumulative_edge_functions[edge.edge_id]
+            if edge.function_state < 0.99 and edge.edge_id not in failure_times:
+                failure_times[edge.edge_id] = wind_matrix.loc[i, "time"]
+            if edge.function_state < 0.99:
+                damaged_edge_count += 1
+
+        metrics = damaged_network.functional_metrics(baseline=baseline)
+        timeline_rows.append(
+            {
+                "time": wind_matrix.loc[i, "time"],
+                "max_wind_ms": float(row.max()),
+                "max_node_wind_ms": float(row.max()),
+                "max_tower_wind_ms": float(tower_row.max()),
+                "KTE": metrics.kte,
+                "KTR": metrics.ktr,
+                "KLC": metrics.klc,
+                "KLC": metrics.klc,
+                "KTE_norm": safe_ratio(metrics.kte, baseline.kte),
+                "KTR_norm": safe_ratio(metrics.ktr, baseline.ktr),
+                "KLC_norm": safe_ratio(metrics.klc, baseline.klc),
+                "K": metrics.k,
+                "function_percent": metrics.k * 100.0,
+                "damaged_edge_count": damaged_edge_count,
+            }
+        )
+
+    if SAVE_DEBUG_TABLES:
+        safe_to_csv(nodes, OUTPUT_DIR / "zhuhai_network_nodes.csv")
+        safe_to_csv(pd.DataFrame(tower_failure_detail_rows), OUTPUT_DIR / "tower_failure_details.csv")
+    if not edges.empty:
+        keep_cols = [
+            "edge_id",
+            "source",
+            "target",
+            "tower_count",
+            "expected_failed_towers",
+            "max_tower_failure_probability",
+            "final_function_state",
+            "damage_level_expected",
+            "failure_time",
+            "failure_order",
+        ]
+        edges["final_function_state"] = edges["edge_id"].map(cumulative_edge_functions)
+        edges["expected_failed_towers"] = edges["edge_id"].map(cumulative_expected_failed_towers)
+        edges["damage_level_expected"] = edges["expected_failed_towers"].apply(damage_level_from_count)
+        edges["max_tower_failure_probability"] = edges["edge_id"].map(cumulative_max_tower_failure_probability)
+        if SIMULATION_MODE == "monte_carlo":
+            edges["mean_damaged_tower_count"] = edges["edge_id"].map(cumulative_mc_mean_damaged)
+            edges["mean_slight_damage_probability"] = edges["edge_id"].map(cumulative_mc_slight_probability)
+            edges["mean_severe_damage_probability"] = edges["edge_id"].map(cumulative_mc_severe_probability)
+        edges["is_damaged"] = edges["final_function_state"] < 0.99
+        edges["failure_time"] = edges["edge_id"].map(failure_times)
+        failed_order = (
+            edges[edges["is_damaged"] & edges["failure_time"].notna()]
+            .sort_values(["failure_time", "edge_id"])
+            .reset_index(drop=True)
+        )
+        order_map = {edge_id: order + 1 for order, edge_id in enumerate(failed_order["edge_id"])}
+        edges["failure_order"] = edges["edge_id"].map(order_map)
+    safe_to_csv(edges[keep_cols], OUTPUT_DIR / "zhuhai_network_edges.csv")
+    timeline = pd.DataFrame(timeline_rows)
+    timeline_cols = [
+        "time",
+        "max_node_wind_ms",
+        "max_tower_wind_ms",
+        "KTE_norm",
+        "KTR_norm",
+        "KLC_norm",
+        "K",
+        "function_percent",
+        "damaged_edge_count",
+    ]
+    safe_to_csv(timeline[timeline_cols], OUTPUT_DIR / "zhuhai_hato_failure_timeline.csv")
+
+    print(f"CLIMADA windfield used: {climada_used}")
+    print("Time step: 3h")
+    print(f"Node exposure count: {len(exposure)}")
+    print(f"Tower exposure count: {len(tower_exposure)}")
+    print(f"Max node wind speed: {timeline['max_node_wind_ms'].max():.2f} m/s")
+    print(f"Max tower wind speed: {timeline['max_tower_wind_ms'].max():.2f} m/s")
+    print(f"Minimum system function: {timeline['function_percent'].min():.2f}%")
+    print(f"Damaged / affected edge count: {int(edges['is_damaged'].sum()) if 'is_damaged' in edges else 0}")
+    print("Key output files saved:")
+    for name in [
+        "climada_node_wind_timeseries.csv",
+        "climada_tower_wind_timeseries.csv",
+        "zhuhai_hato_failure_timeline.csv",
+        "zhuhai_network_edges.csv",
+        "wind_diagnosis.csv",
+        "zhuhai_network_map.png",
+        "zhuhai_function_timeline.png",
+        "zhuhai_wind_timeline.png",
+    ]:
+        print(f"- outputs/{name}")
+
+    plot_zhuhai_network(nodes, edges, towers, track)
+    plot_zhuhai_timelines(timeline)
+
+
+def simulate_zhuhai_hato_mc() -> None:
+    """Docstring."""
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    clean_non_key_outputs()
+
+    network, nodes, edges, line_geometries = build_zhuhai_network_mc()
+    track = resample_track_to_step(read_hato_track(), TIME_STEP_H)
+    baseline = compute_network_metrics_baseline(network)
+
+    exposure = nodes[["id", "lon", "lat"]].copy()
+    exposure["height_m"] = 44.0
+
+    tower_exposure, edges = build_synthetic_tower_exposure(edges, nodes, line_geometries)
+    if len(tower_exposure) == 0:
+        raise ValueError("No synthetic tower exposure points were generated.")
+
+    wind_matrix, tower_wind_matrix, climada_used = run_climada_windfield(track, exposure, tower_exposure)
+    safe_to_csv(wind_matrix, OUTPUT_DIR / "climada_node_wind_timeseries.csv")
+    safe_to_csv(tower_wind_matrix, OUTPUT_DIR / "climada_tower_wind_timeseries.csv")
+    write_wind_diagnosis(track, nodes, tower_exposure, wind_matrix, tower_wind_matrix)
+
+    cumulative_node = wind_matrix.drop(columns=["time"], errors="ignore").cummax()
+    cumulative_tower = tower_wind_matrix.drop(columns=["time"], errors="ignore").cummax()
+    node_ids = exposure["id"].astype(str).tolist()
+    tower_ids = tower_exposure["id"].astype(str).tolist()
+    edge_ids = edges["edge_id"].astype(str).tolist()
+    edge_lookup = edges.set_index("edge_id")
+    node_xy = {row["id"]: (float(row["lon"]), float(row["lat"])) for _, row in nodes.iterrows()}
+    tower_index = {tower_id: idx for idx, tower_id in enumerate(tower_ids)}
+    edge_tower_index_map: dict[str, np.ndarray] = {}
+    for edge_id in edge_ids:
+        tower_list = parse_tower_ids(edge_lookup.loc[edge_id, "tower_ids"])
+        edge_tower_index_map[edge_id] = np.asarray([tower_index[tower_id] for tower_id in tower_list if tower_id in tower_index], dtype=int)
+
+    rng = np.random.default_rng(RANDOM_SEED)
+    node_failed = np.zeros((MONTE_CARLO_SAMPLES, len(node_ids)), dtype=bool)
+    edge_tower_failed_state = {
+        edge_id: np.zeros((MONTE_CARLO_SAMPLES, len(edge_tower_index_map[edge_id])), dtype=bool)
+        for edge_id in edge_ids
+    }
+
+    failure_times: dict[str, pd.Timestamp] = {}
+    cumulative_expected_failed_towers: dict[str, float] = {edge_id: 0.0 for edge_id in edge_ids}
+    cumulative_max_tower_failure_probability: dict[str, float] = {edge_id: 0.0 for edge_id in edge_ids}
+    cumulative_mean_damaged: dict[str, float] = {edge_id: 0.0 for edge_id in edge_ids}
+    cumulative_slight_prob: dict[str, float] = {edge_id: 0.0 for edge_id in edge_ids}
+    cumulative_severe_prob: dict[str, float] = {edge_id: 0.0 for edge_id in edge_ids}
+    edge_mean_state_last: dict[str, float] = {edge_id: 1.0 for edge_id in edge_ids}
+    tower_failure_detail_rows: list[dict[str, object]] = []
+    timeline_rows: list[dict[str, object]] = []
+
+    for time_idx, (_, node_row) in enumerate(cumulative_node.iterrows()):
+        tower_row = cumulative_tower.iloc[time_idx]
+        track_point = track.iloc[time_idx]
+
+        node_intensity = node_row[node_ids].to_numpy(dtype=float)
+        node_p_fail = np.asarray([station_binary_failure_probability(value) for value in node_intensity], dtype=float)
+        node_new_fail = (~node_failed) & (rng.random(node_failed.shape) < node_p_fail[None, :])
+        node_failed |= node_new_fail
+
+        edge_state_samples = np.ones((MONTE_CARLO_SAMPLES, len(edge_ids)), dtype=float)
+        mean_damaged_counts = np.zeros(len(edge_ids), dtype=float)
+        slight_probabilities = np.zeros(len(edge_ids), dtype=float)
+        severe_probabilities = np.zeros(len(edge_ids), dtype=float)
+        expected_failed_counts = np.zeros(len(edge_ids), dtype=float)
+        max_failure_probabilities = np.zeros(len(edge_ids), dtype=float)
+
+        for edge_pos, edge_id in enumerate(edge_ids):
+            edge_meta = edge_lookup.loc[edge_id]
+            line_bearing = edge_bearing(edge_meta, node_xy)
+            edge_function, expected_failed, max_pf, tower_probabilities, detail_rows = compute_edge_function_from_towers(
+                edge_meta,
+                tower_row,
+                tower_exposure,
+                track_point,
+                line_bearing,
+            )
+            if SAVE_DEBUG_TABLES:
+                tower_failure_detail_rows.extend(detail_rows)
+
+            tower_state = edge_tower_failed_state[edge_id]
+            if len(tower_probabilities) > 0:
+                tower_new_fail = (~tower_state) & (rng.random(tower_state.shape) < tower_probabilities[None, :])
+                tower_state |= tower_new_fail
+                counts = tower_state.sum(axis=1)
+                edge_state_samples[:, edge_pos] = np.where(counts == 0, 1.0, np.where(counts < 3, 0.8, 0.0))
+                mean_damaged_counts[edge_pos] = float(np.mean(counts))
+                slight_probabilities[edge_pos] = float(np.mean((counts > 0) & (counts < 3)))
+                severe_probabilities[edge_pos] = float(np.mean(counts >= 3))
+                expected_failed_counts[edge_pos] = float(expected_failed)
+                max_failure_probabilities[edge_pos] = float(max_pf)
+            else:
+                counts = np.zeros(MONTE_CARLO_SAMPLES, dtype=float)
+                edge_state_samples[:, edge_pos] = 1.0
+
+            edge_mean_state = float(edge_state_samples[:, edge_pos].mean())
+            edge_mean_state_last[edge_id] = edge_mean_state
+            cumulative_expected_failed_towers[edge_id] = float(expected_failed_counts[edge_pos])
+            cumulative_max_tower_failure_probability[edge_id] = float(max_failure_probabilities[edge_pos])
+            cumulative_mean_damaged[edge_id] = float(mean_damaged_counts[edge_pos])
+            cumulative_slight_prob[edge_id] = float(slight_probabilities[edge_pos])
+            cumulative_severe_prob[edge_id] = float(severe_probabilities[edge_pos])
+            if edge_mean_state < 0.99 and edge_id not in failure_times:
+                failure_times[edge_id] = pd.Timestamp(track_point["time"])
+
+        sample_kte = np.zeros(MONTE_CARLO_SAMPLES, dtype=float)
+        sample_ktr = np.zeros(MONTE_CARLO_SAMPLES, dtype=float)
+        sample_klc = np.zeros(MONTE_CARLO_SAMPLES, dtype=float)
+        sample_k = np.zeros(MONTE_CARLO_SAMPLES, dtype=float)
+        for sample_idx in range(MONTE_CARLO_SAMPLES):
+            sample_network = network.copy()
+            for node_pos, node_id in enumerate(node_ids):
+                sample_network.nodes[node_id].function_state = 0.0 if node_failed[sample_idx, node_pos] else 1.0
+            for edge_pos, edge_id in enumerate(edge_ids):
+                sample_network.edges[edge_id].function_state = float(edge_state_samples[sample_idx, edge_pos])
+            metrics = compute_network_metrics_baseline(sample_network, baseline=baseline)
+            sample_kte[sample_idx] = metrics.kte
+            sample_ktr[sample_idx] = metrics.ktr
+            sample_klc[sample_idx] = metrics.klc
+            sample_k[sample_idx] = metrics.k
+
+        damaged_edge_count = float(np.mean((edge_state_samples < 0.99).sum(axis=1)))
+        timeline_rows.append(
+            {
+                "time": track_point["time"],
+                "max_node_wind_ms": float(node_row.max()),
+                "max_tower_wind_ms": float(tower_row.max()),
+                "KTE_norm": float(sample_kte.mean()),
+                "KTR_norm": float(sample_ktr.mean()),
+                "KLC_norm": float(sample_klc.mean()),
+                "K": float(sample_k.mean()),
+                "function_percent": float(sample_k.mean() * 100.0),
+                "damaged_edge_count": damaged_edge_count,
+            }
+        )
+
+    if SAVE_DEBUG_TABLES and tower_failure_detail_rows:
+        safe_to_csv(pd.DataFrame(tower_failure_detail_rows), OUTPUT_DIR / "tower_failure_details.csv")
+
+    edges["final_function_state"] = [edge_mean_state_last[edge_id] for edge_id in edges["edge_id"].astype(str)]
+    edges["expected_failed_towers"] = [cumulative_expected_failed_towers[edge_id] for edge_id in edges["edge_id"].astype(str)]
+    edges["max_tower_failure_probability"] = [cumulative_max_tower_failure_probability[edge_id] for edge_id in edges["edge_id"].astype(str)]
+    edges["mean_damaged_tower_count"] = [cumulative_mean_damaged[edge_id] for edge_id in edges["edge_id"].astype(str)]
+    edges["mean_slight_damage_probability"] = [cumulative_slight_prob[edge_id] for edge_id in edges["edge_id"].astype(str)]
+    edges["mean_severe_damage_probability"] = [cumulative_severe_prob[edge_id] for edge_id in edges["edge_id"].astype(str)]
+    edges["damage_level_expected"] = edges["expected_failed_towers"].apply(damage_level_from_count)
+    edges["is_damaged"] = edges["final_function_state"] < 0.99
+    edges["failure_time"] = edges["edge_id"].map(failure_times)
+    failed_order = (
+        edges[edges["is_damaged"] & edges["failure_time"].notna()]
+        .sort_values(["failure_time", "edge_id"])
+        .reset_index(drop=True)
+    )
+    order_map = {edge_id: order + 1 for order, edge_id in enumerate(failed_order["edge_id"])}
+    edges["failure_order"] = edges["edge_id"].map(order_map)
+
+    safe_to_csv(edges[[
+        "edge_id",
+        "source",
+        "target",
+        "tower_count",
+        "expected_failed_towers",
+        "max_tower_failure_probability",
+        "final_function_state",
+        "damage_level_expected",
+        "failure_time",
+        "failure_order",
+        "mean_damaged_tower_count",
+        "mean_slight_damage_probability",
+        "mean_severe_damage_probability",
+    ]], OUTPUT_DIR / "zhuhai_network_edges.csv")
+
+    timeline = pd.DataFrame(timeline_rows)
+    safe_to_csv(timeline[[
+        "time",
+        "max_node_wind_ms",
+        "max_tower_wind_ms",
+        "KTE_norm",
+        "KTR_norm",
+        "KLC_norm",
+        "K",
+        "function_percent",
+        "damaged_edge_count",
+    ]], OUTPUT_DIR / "zhuhai_hato_failure_timeline.csv")
+
+    print(f"CLIMADA windfield used: {climada_used}")
+    print(f"Time step: {TIME_STEP_H}h")
+    print(f"Node exposure count: {len(exposure)}")
+    print(f"Tower exposure count: {len(tower_exposure)}")
+    print(f"Max node wind speed: {timeline['max_node_wind_ms'].max():.2f} m/s")
+    print(f"Max tower wind speed: {timeline['max_tower_wind_ms'].max():.2f} m/s")
+    print(f"Minimum system function: {timeline['function_percent'].min():.2f}%")
+    print(f"Damaged / affected edge count: {int(edges['is_damaged'].sum())}")
+    print("Key output files saved:")
+    for name in [
+        "climada_node_wind_timeseries.csv",
+        "climada_tower_wind_timeseries.csv",
+        "zhuhai_hato_failure_timeline.csv",
+        "zhuhai_network_edges.csv",
+        "wind_diagnosis.csv",
+        "zhuhai_network_map.png",
+        "zhuhai_function_timeline.png",
+        "zhuhai_wind_timeline.png",
+    ]:
+        print(f"- outputs/{name}")
+
+    plot_zhuhai_network(nodes, edges, tower_exposure, track)
+    plot_zhuhai_timelines(timeline)
+
+
+def plot_zhuhai_network(
+    nodes: pd.DataFrame,
+    edges: pd.DataFrame,
+    towers: gpd.GeoDataFrame,
+    track: pd.DataFrame,
+) -> None:
+    """Docstring."""
+
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+        from shapely.geometry import LineString, box
+
+        boundary = gpd.read_file(RAW_DIR / "zhuhai_boundary.shp").to_crs("EPSG:4326")
+        minx, miny, maxx, maxy = boundary.total_bounds
+        pad_x = (maxx - minx) * 0.08
+        pad_y = (maxy - miny) * 0.08
+        plot_minx = minx - pad_x
+        plot_maxx = maxx + pad_x
+        plot_miny = miny - pad_y
+        plot_maxy = maxy + pad_y
+        track_buffer_x = 0.8
+        track_buffer_y = 0.8
+        track_local = track[
+            (track["lon"] >= minx - track_buffer_x)
+            & (track["lon"] <= maxx + track_buffer_x)
+            & (track["lat"] >= miny - track_buffer_y)
+            & (track["lat"] <= maxy + track_buffer_y)
+        ].copy()
+        if len(track_local) < 2:
+            track_buffer_x = 1.2
+            track_buffer_y = 1.2
+            track_local = track[
+                (track["lon"] >= minx - track_buffer_x)
+                & (track["lon"] <= maxx + track_buffer_x)
+                & (track["lat"] >= miny - track_buffer_y)
+                & (track["lat"] <= maxy + track_buffer_y)
+            ].copy()
+
+        fig, ax = plt.subplots(figsize=(9, 8))
+        boundary.boundary.plot(ax=ax, color="black", linewidth=1)
+        xy = {row["id"]: (row["lon"], row["lat"]) for _, row in nodes.iterrows()}
+        lines_gdf = gpd.read_file(RAW_DIR / "lines.shp").to_crs("EPSG:4326")
+        line_geometries = {int(row["FID_PowerT"]): row.geometry for _, row in lines_gdf.iterrows()}
+
+        def plot_edge_geometry(edge: pd.Series, color: str, linewidth: float, alpha: float, zorder: int) -> None:
+            line_fid = edge.get("line_fid", np.nan)
+            if pd.notna(line_fid) and int(line_fid) in line_geometries:
+                geometry = line_geometries[int(line_fid)]
+                geometries = list(geometry.geoms) if geometry.geom_type == "MultiLineString" else [geometry]
+                for geom in geometries:
+                    xs, ys = geom.xy
+                    ax.plot(xs, ys, color=color, linewidth=linewidth, alpha=alpha, zorder=zorder)
+                return
+            if edge["source"] in xy and edge["target"] in xy:
+                sx, sy = xy[edge["source"]]
+                tx, ty = xy[edge["target"]]
+                ax.plot([sx, tx], [sy, ty], color=color, linewidth=linewidth, alpha=alpha, zorder=zorder)
+
+        def edge_is_failed(edge: pd.Series) -> bool:
+            return str(edge.get("is_damaged", False)).lower() in {"true", "1"}
+
+        normal_edges = edges[~edges.apply(edge_is_failed, axis=1)]
+        failed_edges = edges[edges.apply(edge_is_failed, axis=1)]
+
+        for _, edge in normal_edges.iterrows():
+            plot_edge_geometry(edge, color="#6c757d", linewidth=1, alpha=0.65, zorder=1)
+
+        for _, edge in failed_edges.iterrows():
+            if edge["source"] not in xy or edge["target"] not in xy:
+                continue
+            plot_edge_geometry(edge, color="red", linewidth=1.8, alpha=0.95, zorder=4)
+            if pd.notna(edge.get("failure_order", np.nan)):
+                line_fid = edge.get("line_fid", np.nan)
+                if pd.notna(line_fid) and int(line_fid) in line_geometries:
+                    midpoint = line_geometries[int(line_fid)].interpolate(0.5, normalized=True)
+                    mx, my = midpoint.x, midpoint.y
+                else:
+                    sx, sy = xy[edge["source"]]
+                    tx, ty = xy[edge["target"]]
+                    mx = (sx + tx) / 2.0
+                    my = (sy + ty) / 2.0
+                ax.text(
+                    mx,
+                    my,
+                    str(int(edge["failure_order"])),
+                    fontsize=7,
+                    color="darkred",
+                    ha="center",
+                    va="center",
+                    zorder=6,
+                    bbox={"boxstyle": "round,pad=0.12", "fc": "white", "ec": "none", "alpha": 0.75},
+                )
+        plants = nodes[nodes["type"] == "plant"]
+        substations = nodes[nodes["type"] == "substation"]
+        ax.scatter(plants["lon"], plants["lat"], s=18, c="#f4a261", marker="o", label="plants", zorder=3)
+        ax.scatter(substations["lon"], substations["lat"], s=22, c="#2a9d8f", marker="o", label="substations", zorder=3)
+        ax.scatter(
+            towers.geometry.x,
+            towers.geometry.y,
+            s=2.5,
+            facecolors="none",
+            edgecolors="#277da1",
+            linewidths=0.28,
+            marker="^",
+            label="towers",
+            alpha=0.32,
+            zorder=2,
+        )
+
+        if len(track_local) >= 2:
+            map_box = box(plot_minx, plot_miny, plot_maxx, plot_maxy)
+            clipped = LineString(list(zip(track_local["lon"], track_local["lat"]))).intersection(map_box)
+            if not clipped.is_empty:
+                segments = [clipped] if clipped.geom_type == "LineString" else list(clipped.geoms)
+                for segment in segments:
+                    coords = list(segment.coords)
+                    if len(coords) < 2:
+                        continue
+                    xs, ys = zip(*coords)
+                    ax.plot(xs, ys, color="blue", linestyle="--", linewidth=1.5, alpha=0.8, label="typhoon path", zorder=3)
+                    ax.scatter(xs, ys, s=12, c="blue", alpha=0.8, zorder=3)
+                    start = coords[0]
+                    end = coords[-1]
+                    ax.annotate(
+                        "",
+                        xy=end,
+                        xytext=start,
+                        arrowprops={"arrowstyle": "->", "color": "blue", "lw": 1.0, "alpha": 0.8},
+                        zorder=3,
+                        clip_on=True,
+                    )
+                visible_points = track_local[
+                    (track_local["lon"] >= plot_minx)
+                    & (track_local["lon"] <= plot_maxx)
+                    & (track_local["lat"] >= plot_miny)
+                    & (track_local["lat"] <= plot_maxy)
+                ]
+                step = 2 if len(visible_points) <= 12 else 3
+                for local_order, (_, point) in enumerate(visible_points.iloc[::step].iterrows(), start=1):
+                    ax.text(point["lon"], point["lat"], str(local_order), fontsize=6, color="blue", zorder=5, clip_on=True)
+
+        legend_handles = [
+            Line2D([0], [0], color="#6c757d", lw=1.5, label="normal lines"),
+            Line2D([0], [0], color="red", lw=1.5, label="failed lines"),
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="#f4a261", markersize=6, label="plants"),
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="#2a9d8f", markersize=6, label="substations"),
+            Line2D([0], [0], marker="^", color="#277da1", markerfacecolor="none", markeredgecolor="#277da1", linestyle="None", markersize=4, label="towers"),
+            Line2D([0], [0], color="#1d4ed8", linestyle="--", lw=1.4, label="typhoon path"),
+        ]
+        ax.set_title("Zhuhai power infrastructure network")
+        ax.set_xlabel("longitude")
+        ax.set_ylabel("latitude")
+        ax.legend(handles=legend_handles, loc="best", fontsize=8)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(plot_minx, plot_maxx)
+        ax.set_ylim(plot_miny, plot_maxy)
+        fig.tight_layout()
+        fig.savefig(OUTPUT_DIR / "zhuhai_network_map.png", dpi=200)
+        plt.close(fig)
+    except Exception as exc:
+        print(f"Map output skipped: {exc}")
+
+
+def plot_zhuhai_timelines(timeline: pd.DataFrame) -> None:
+    """Docstring."""
+
+    try:
+        import matplotlib.pyplot as plt
+
+        time = pd.to_datetime(timeline["time"])
+
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        ax.plot(time, timeline["function_percent"], color="#d62828", linewidth=1.8)
+        min_idx = timeline["function_percent"].idxmin()
+        ax.scatter(time.loc[min_idx], timeline.loc[min_idx, "function_percent"], color="#d62828", s=28, zorder=3)
+        ax.annotate(
+            f"min={timeline.loc[min_idx, 'function_percent']:.2f}%",
+            xy=(time.loc[min_idx], timeline.loc[min_idx, "function_percent"]),
+            xytext=(8, 8),
+            textcoords="offset points",
+            fontsize=8,
+        )
+        ax.set_title("Zhuhai system function timeline")
+        ax.set_xlabel("time")
+        ax.set_ylabel("function (%)")
+        ax.grid(alpha=0.25)
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        fig.savefig(OUTPUT_DIR / "zhuhai_function_timeline.png", dpi=200)
+        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        ax.plot(time, timeline["max_node_wind_ms"], label="max node wind", linewidth=1)
+        ax.plot(time, timeline["max_tower_wind_ms"], label="max tower wind", linewidth=1)
+        ax.set_title("Zhuhai maximum wind timeline")
+        ax.set_xlabel("time")
+        ax.set_ylabel("wind speed (m/s)")
+        ax.legend()
+        ax.grid(alpha=0.25)
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        fig.savefig(OUTPUT_DIR / "zhuhai_wind_timeline.png", dpi=200)
+        plt.close(fig)
+    except Exception as exc:
+        print(f"Timeline figures skipped: {exc}")
+
+
+def demo_network() -> PowerNetwork:
+    network = PowerNetwork()
+    network.add_node(Node("P1", "plant", generation=100))
+    network.add_node(Node("S1", "substation", load=60))
+    network.add_node(Node("B1", "bus", load=40))
+    network.add_edge(Edge("L1", "P1", "S1", 10))
+    network.add_edge(Edge("L2", "S1", "B1", 12))
+    return network
+
+
+def main() -> None:
+    print("failure_evolution.py is running.")
+
+    if (RAW_DIR / "manual_network.xlsx").exists():
+        simulate_zhuhai_hato_mc()
+        return
+
+    k_component = expected_component_function(35.0, PLANT_SUBSTATION_FRAGILITY)
+    print(f"35 m/s 椋庨€熶笅锛岀粍浠舵湡鏈涘姛鑳?k = {k_component:.3f}")
+
+    wind = wind_speed_at_height_ms(
+        distance_to_center_m=20_000,
+        height_m=44,
+        center_pressure_hpa=950,
+        latitude_deg=22,
+        movement_speed_ms=5,
+    )
+    print(f"绀轰緥鍙伴涓嬶紝20 km 澶勩€?4 m 楂樺害椋庨€?= {wind:.2f} m/s")
+
+    network = demo_network()
+    baseline = network.functional_metrics()
+    network.edges["L2"].function_state = 0.0
+    damaged = network.functional_metrics(baseline=baseline)
+    print(f"绾胯矾 L2 澶辨晥鍚庯紝绯荤粺缁煎悎鍔熻兘 K = {damaged.k:.3f}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        if sys.stdin.isatty():
+            try:
+                input("\n运行结束。按回车退出...")
+            except EOFError:
+                pass
